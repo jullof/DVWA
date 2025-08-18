@@ -43,8 +43,8 @@ pipeline {
           sh '''
             set -e
             echo "Shipping image to ${APP_HOST} ..."
-            docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 | \
-            ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'bunzip2 | docker load'
+            docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip | \
+            ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'gunzip | docker load'
           '''
         }
       }
