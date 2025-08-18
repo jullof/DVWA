@@ -10,7 +10,7 @@ pipeline {
     
     APP_HOST = '192.168.191.132'    
     APP_USER = 'app'                
-    SSH_CRED = 'app-ssh'          
+    SSH_CRED = 'app'          
     IMAGE_NAME = 'dvwa-local'      
     IMAGE_TAG  = "${env.BUILD_NUMBER}"
     DEPLOY_DIR = '/opt/dvwa'
