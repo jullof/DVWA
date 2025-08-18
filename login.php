@@ -92,7 +92,7 @@ echo "<!DOCTYPE html>
 
 	<fieldset>
 
-			<label for=\"user\">User</label> <input type=\"text\" class=\"loginInput\" size=\"20\" name=\"username\"><br />
+			<label for=\"user\">Username</label> <input type=\"text\" class=\"loginInput\" size=\"20\" name=\"username\"><br />
 
 
 			<label for=\"pass\">Password</label> <input type=\"password\" class=\"loginInput\" AUTOCOMPLETE=\"off\" size=\"20\" name=\"password\"><br />
