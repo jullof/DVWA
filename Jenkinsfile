@@ -137,6 +137,26 @@ pipeline {
         }
       }
     }
+    stage('Static Code Analysis (Semgrep)') {
+  steps {
+    sh '''
+      set -e
+      echo "Running Semgrep via Docker..."
+      docker run --rm -v "$PWD":/src -w /src returntocorp/semgrep \
+        semgrep --config=auto --error --json > semgrep-results.json || true
+
+      if [ -s semgrep-results.json ]; then
+        echo "⚠️ Semgrep found issues"
+        jq '.results | length' semgrep-results.json || true
+        exit 1
+      else
+        echo "✅ No Semgrep issues"
+      fi
+    '''
+    archiveArtifacts artifacts: 'semgrep-results.json', onlyIfSuccessful: false
+  }
+}
+
   }
 
   post {
