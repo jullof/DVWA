@@ -8,12 +8,21 @@ pipeline {
 
   environment {
     
-    APP_HOST = '192.168.191.132'    
-    APP_USER = 'app'                
-    SSH_CRED = 'app'          
-    IMAGE_NAME = 'dvwa-local'      
+    APP_HOST = '192.168.191.132'
+    APP_USER = 'app'
+    SSH_CRED = 'app'
+
+   
+    IMAGE_NAME = 'dvwa-local'
     IMAGE_TAG  = "${env.BUILD_NUMBER}"
     DEPLOY_DIR = '/opt/dvwa'
+
+    // --- Snyk config ---
+  
+    SNYK_CRED = 'snyk-token'
+    SNYK_SEVERITY = 'medium'       
+    SNYK_CLI = "${env.WORKSPACE}/bin/snyk"
+    PATH = "${env.WORKSPACE}/bin:${env.PATH}"
   }
 
   stages {
@@ -26,6 +35,34 @@ pipeline {
       }
     }
 
+    stage('Setup Snyk CLI') {
+      steps {
+        sh '''
+          set -e
+          mkdir -p bin
+          if [ ! -x "${SNYK_CLI}" ]; then
+            echo "Downloading Snyk CLI..."
+            curl -sSL https://static.snyk.io/cli/latest/snyk-linux -o "${SNYK_CLI}"
+            chmod +x "${SNYK_CLI}"
+          fi
+          "${SNYK_CLI}" --version
+        '''
+      }
+    }
+
+    stage('SCA (Snyk test)') {
+      steps {
+        withCredentials([string(credentialsId: env.SNYK_CRED, variable: 'SNYK_TOKEN')]) {
+          sh '''
+            set -e
+            echo "Running Snyk SCA (fail on >= ${SNYK_SEVERITY}) ..."
+            # Scan all supported manifests in repo (composer, npm, etc.)
+            SNYK_TOKEN="$SNYK_TOKEN" "${SNYK_CLI}" test --all-projects --severity-threshold="${SNYK_SEVERITY}"
+          '''
+        }
+      }
+    }
+
     stage('Build Docker image') {
       steps {
         sh '''
@@ -34,6 +71,20 @@ pipeline {
           echo "Building image: ${IMAGE_NAME}:${IMAGE_TAG}"
           docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
         '''
+      }
+    }
+
+    stage('Container scan (Snyk)') {
+      steps {
+        withCredentials([string(credentialsId: env.SNYK_CRED, variable: 'SNYK_TOKEN')]) {
+          sh '''
+            set -e
+            echo "Scanning container image with Snyk (fail on >= ${SNYK_SEVERITY}) ..."
+            SNYK_TOKEN="$SNYK_TOKEN" "${SNYK_CLI}" container test "${IMAGE_NAME}:${IMAGE_TAG}" \
+              --file=Dockerfile \
+              --severity-threshold="${SNYK_SEVERITY}"
+          '''
+        }
       }
     }
 
