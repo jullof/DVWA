@@ -1,5 +1,6 @@
 pipeline {
   agent any
+
   options {
     timestamps()
     ansiColor('xterm')
@@ -7,25 +8,16 @@ pipeline {
   }
 
   environment {
-    
     APP_HOST = '192.168.191.132'
     APP_USER = 'app'
-    SSH_CRED = 'app'
-
-   
+    SSH_CRED = 'app'                  
     IMAGE_NAME = 'dvwa-local'
     IMAGE_TAG  = "${env.BUILD_NUMBER}"
     DEPLOY_DIR = '/opt/dvwa'
-
-    // --- Snyk config ---
-  
-    SNYK_CRED = 'snyk-token'
-    SNYK_SEVERITY = 'medium'       
-    SNYK_CLI = "${env.WORKSPACE}/bin/snyk"
-    PATH = "${env.WORKSPACE}/bin:${env.PATH}"
   }
 
   stages {
+
     stage('Checkout') {
       steps {
         checkout([$class: 'GitSCM',
@@ -40,26 +32,36 @@ pipeline {
         sh '''
           set -e
           mkdir -p bin
-          if [ ! -x "${SNYK_CLI}" ]; then
-            echo "Downloading Snyk CLI..."
-            curl -sSL https://static.snyk.io/cli/latest/snyk-linux -o "${SNYK_CLI}"
-            chmod +x "${SNYK_CLI}"
+          if [ ! -x "$PWD/bin/snyk" ]; then
+            curl -fsSL https://static.snyk.io/cli/latest/snyk-linux -o bin/snyk
+            chmod +x bin/snyk
           fi
-          "${SNYK_CLI}" --version
+          "$PWD/bin/snyk" --version
         '''
       }
     }
 
     stage('SCA (Snyk test)') {
       steps {
-        withCredentials([string(credentialsId: env.SNYK_CRED, variable: 'SNYK_TOKEN')]) {
+        withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
             set -e
-            echo "Running Snyk SCA (fail on >= ${SNYK_SEVERITY}) ..."
-            # Scan all supported manifests in repo (composer, npm, etc.)
-            SNYK_TOKEN="$SNYK_TOKEN" "${SNYK_CLI}" test --all-projects --severity-threshold="${SNYK_SEVERITY}"
+            echo "Running Snyk SCA (fail on >= medium) ..."
+            SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" test --all-projects --severity-threshold=medium
           '''
         }
+      }
+    }
+
+    stage('Semgrep (SAST - alerts only)') {
+      steps {
+        sh '''
+          set -e
+          echo "Running Semgrep with built-in auto rules (non-blocking)..."
+          docker run --rm -v "$PWD:/src" -w /src returntocorp/semgrep:latest \
+            semgrep scan --config=auto --sarif --output semgrep.sarif || true
+        '''
+        archiveArtifacts artifacts: 'semgrep.sarif', onlyIfSuccessful: false, allowEmptyArchive: true
       }
     }
 
@@ -76,13 +78,12 @@ pipeline {
 
     stage('Container scan (Snyk)') {
       steps {
-        withCredentials([string(credentialsId: env.SNYK_CRED, variable: 'SNYK_TOKEN')]) {
+        withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
             set -e
-            echo "Scanning container image with Snyk (fail on >= ${SNYK_SEVERITY}) ..."
-            SNYK_TOKEN="$SNYK_TOKEN" "${SNYK_CLI}" container test "${IMAGE_NAME}:${IMAGE_TAG}" \
-              --file=Dockerfile \
-              --severity-threshold="${SNYK_SEVERITY}"
+            echo "Scanning container image with Snyk (fail on >= medium) ..."
+            SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG} \
+              --file=Dockerfile --severity-threshold=medium
           '''
         }
       }
@@ -95,7 +96,7 @@ pipeline {
             set -e
             echo "Shipping image to ${APP_HOST} ..."
             docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip | \
-            ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'gunzip | docker load'
+              ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'gunzip | docker load'
           '''
         }
       }
@@ -137,33 +138,16 @@ pipeline {
         }
       }
     }
-  stage('Static Code Analysis (Semgrep)') {
-  steps {
-    sh '''
-      set -e
-      echo "🔎 Running Semgrep (non-blocking mode)..."
-      docker run --rm -v "$PWD":/src -w /src returntocorp/semgrep \
-        semgrep --config=auto --json > semgrep-results.json || true
-
-      echo "---- SEMGREP REPORT ----"
-      cat semgrep-results.json | jq '.results[] | {check_id, path, start, severity, message}'
-      echo "------------------------"
-
-      echo "⚠️  Semgrep finished, results above (pipeline will continue)."
-    '''
-    archiveArtifacts artifacts: 'semgrep-results.json', onlyIfSuccessful: false
-  }
-}
-}
-
-  }
+  } 
 
   post {
     success {
       echo "✅ Deployed ${IMAGE_NAME}:${IMAGE_TAG} → http://${APP_HOST}:8080"
+      archiveArtifacts artifacts: 'semgrep.sarif', onlyIfSuccessful: true, allowEmptyArchive: true
     }
     failure {
       echo "❌ Build/Deploy failed. Check the stage logs."
+      archiveArtifacts artifacts: 'semgrep.sarif', onlyIfSuccessful: false, allowEmptyArchive: true
     }
   }
 }
