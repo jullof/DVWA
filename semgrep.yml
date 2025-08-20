@@ -24,8 +24,8 @@ rules:
 
     # Final destination
     pattern-sinks:
-      - pattern: echo $X
-      - pattern: print $X
+      - pattern: echo $X;
+      - pattern: print $X;
       - pattern: "<?= $X ?>"
       - pattern: printf($F, ..., $X, ...)
       - pattern: vprintf($F, ..., $X, ...)
