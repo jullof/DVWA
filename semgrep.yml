@@ -26,17 +26,16 @@ rules:
     pattern-sinks:
       - pattern: echo $X;
       - pattern: print $X;
-      - pattern: "<?= $X ?>"
-      - pattern: printf($F, ..., $X, ...)
-      - pattern: vprintf($F, ..., $X, ...)
-      - pattern: trigger_error($X, ...)
+      - pattern: printf($F, ..., $X, ...);  
+      - pattern: vprintf($F, ..., $X, ...);
+      - pattern: trigger_error($X, ...);
 
     # If it is used with these:
     pattern-sanitizers:
-      - pattern: htmlspecialchars($X, ...)
-      - pattern: htmlentities($X, ...)
-      - pattern: htmlspecialchars(strip_tags($X), ..., ...)
-      - pattern: filter_var($X, FILTER_SANITIZE_SPECIAL_CHARS, ...)
+      - pattern: htmlspecialchars($X, ...);
+      - pattern: htmlentities($X, ...);
+      - pattern: htmlspecialchars(strip_tags($X), ..., ...);
+      - pattern: filter_var($X, FILTER_SANITIZE_SPECIAL_CHARS, ...);
 
   # RCE (eval/assert) – Input is treated like a code problem
 
@@ -56,11 +55,11 @@ rules:
       - pattern: $_POST[$K]
       - pattern: $_REQUEST[$K]
       - pattern: $_COOKIE[$K]
-      - pattern: file_get_contents('php://input')
+      - pattern: file_get_contents('php://input');
 
     pattern-sinks:
-      - pattern: eval($X)
-      - pattern: assert($X)
+      - pattern: eval($X);
+      - pattern: assert($X);
 
   # RCE (OS Command Injection) – User input goes to shell
 
@@ -81,18 +80,18 @@ rules:
       - pattern: $_POST[$K]
       - pattern: $_REQUEST[$K]
       - pattern: $_COOKIE[$K]
-      - pattern: file_get_contents('php://input')
+      - pattern: file_get_contents('php://input');
 
     pattern-sinks:
-      - pattern: system($X, ...)
-      - pattern: exec($X, ...)
+      - pattern: system($X, ...);
+      - pattern: exec($X, ...);
       - pattern: shell_exec($X)
-      - pattern: passthru($X, ...)
-      - pattern: popen($X, ...)
-      - pattern: proc_open($X, ...)
+      - pattern: passthru($X, ...);
+      - pattern: popen($X, ...);
+      - pattern: proc_open($X, ...);
 
 
     # Possible remediation functions
     pattern-sanitizers:
-      - pattern: escapeshellarg($X)
-      - pattern: escapeshellcmd($X)
+      - pattern: escapeshellarg($X);
+      - pattern: escapeshellcmd($X);
