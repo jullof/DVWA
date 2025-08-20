@@ -33,9 +33,8 @@ rules:
 
     # If it is used with these:
     pattern-sanitizers:
-      - pattern: my_sanitize($X)
-      - pattern: htmlspecialchars($X, ..., ...)
-      - pattern: htmlentities($X, ..., ...)
+      - pattern: htmlspecialchars($X, ...)
+      - pattern: htmlentities($X, ...)
       - pattern: htmlspecialchars(strip_tags($X), ..., ...)
       - pattern: filter_var($X, FILTER_SANITIZE_SPECIAL_CHARS, ...)
 

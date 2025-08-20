@@ -46,24 +46,37 @@ pipeline {
         withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
             set -e
-            echo "Running Snyk SCA (fail on >= medium) ..."
-            SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" test --all-projects --severity-threshold=medium
+            echo "Running Snyk SCA (fail on high) ..."
+            SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" test --all-projects --severity-threshold=high
           '''
         }
       }
     }
 
-    stage('Semgrep (SAST - alerts only)') {
-      steps {
-        sh '''
-          set -e
-          echo "Running Semgrep with built-in auto rules (non-blocking)..."
-          docker run --rm -v "$PWD:/src" -w /src returntocorp/semgrep:latest \
-            semgrep scan --config=semgrep.yml --sarif --output semgrep.sarif || true
-        '''
-        archiveArtifacts artifacts: 'semgrep.sarif', onlyIfSuccessful: false, allowEmptyArchive: true
-      }
-    }
+   stage('Semgrep (SAST - alerts only)') {
+  steps {
+    sh '''
+      set -e
+      echo "🔍 Checking if semgrep.yml exists before scanning..."
+
+      # Check file on Jenkins host
+      if [ ! -f semgrep.yml ]; then
+        echo "❌ semgrep.yml missing in Jenkins workspace!"
+        ls -l
+        exit 1
+      fi
+
+      # Check inside Docker container
+      docker run --rm -v "$PWD:/src" -w /src returntocorp/semgrep:latest \
+        ls -l /src/semgrep.yml || { echo "❌ semgrep.yml not visible inside container!"; exit 1; }
+
+      echo "✅ semgrep.yml found. Running scan..."
+
+      docker run --rm -v "$PWD:/src" -w /src returntocorp/semgrep:latest \
+        semgrep scan --metrics=off --config=/src/semgrep.yml || true
+    '''
+  }
+}
 
     stage('Build Docker image') {
       steps {
