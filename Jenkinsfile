@@ -59,7 +59,7 @@ pipeline {
           set -e
           echo "Running Semgrep with built-in auto rules (non-blocking)..."
           docker run --rm -v "$PWD:/src" -w /src returntocorp/semgrep:latest \
-            semgrep scan --config=auto --sarif --output semgrep.sarif || true
+            semgrep scan --config=semgrep.yml --sarif --output semgrep.sarif || true
         '''
         archiveArtifacts artifacts: 'semgrep.sarif', onlyIfSuccessful: false, allowEmptyArchive: true
       }
