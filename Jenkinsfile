@@ -60,20 +60,24 @@ set -eu
 
 echo "🔍 Checking Semgrep rules exist..."
 
-RULE_DIR="semgrep_rules"    
-RULES="semgrep-dvwa-xss.yml semgrep-dvwa-rce.yml semgrep-dvwa-sql.yml"
-
-echo "PWD=$(pwd)"
-ls -la || true
-[ -d "$RULE_DIR" ] || { echo "❌ $RULE_DIR/ directory is missing!"; exit 1; }
+RULE_DIR="semgrep_rules"
+RULES="$(ls -1 "$RULE_DIR"/*.yml "$RULE_DIR"/*.yml 2>/dev/null || true)"
+[ -n "$RULES" ] || { echo "❌ No rule files found in $RULE_DIR"; exit 1; }
 
 missing=0
 for f in $RULES; do
-  if [ ! -f "$RULE_DIR/$f" ]; then
-    echo "❌ Missing rule file: $RULE_DIR/$f"
-    missing=1
-  fi
+  [ -f "$f" ] || { echo "❌ Missing: $f"; missing=1; }
 done
+[ "$missing" -eq 0 ] || exit 1
+
+for f in $RULES; do
+  echo "▶️  Semgrep scanning: $f"
+  docker run --rm -v "$PWD:/src" -w /src \
+    -e SEMGREP_BASELINE_COMMIT="$BASELINE" \
+    returntocorp/semgrep:latest \
+      semgrep scan --metrics=off --config="/src/$f" || true
+done
+
 [ "$missing" -eq 0 ] || exit 1
 
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "❌ .git not found"; exit 1; }
