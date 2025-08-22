@@ -53,73 +53,70 @@ pipeline {
       }
     }
 
- stage('Semgrep (SAST - alerts only)') {
+stage('Semgrep (SAST - alerts only)') {
   steps {
     sh '''
-      set -eu
-      echo "🔍 Checking Semgrep rules exist..."
+#!/usr/bin/env bash
+set -eu
 
-      RULE_DIR="semgrep_rules"
-      RULES=(
-        "semgrep-dvwa-xss.yml"
-        "semgrep-dvwa-rce.yml"
-        "semgrep-dvwa-sql.yml"
-      )
+echo "🔍 Checking Semgrep rules exist..."
 
-      if [ ! -d "$RULE_DIR" ]; then
-        echo "❌ $RULE_DIR/ directory is missing in Jenkins workspace!"
-        ls -la
-        exit 1
-      fi
+RULE_DIR="semgrep_rules"
+RULES="semgrep-dvwa-xss.yml semgrep-dvwa-rce.yml semgrep-dvwa-sql.yml"
 
-      missing=0
-      for f in "${RULES[@]}"; do
-        if [ ! -f "$RULE_DIR/$f" ]; then
-          echo "❌ Missing rule file: $RULE_DIR/$f"
-          missing=1
-        fi
-      done
-      [ "$missing" -eq 0 ] || exit 1
+# Ensure rule dir & files exist
+if [ ! -d "$RULE_DIR" ]; then
+  echo "❌ $RULE_DIR/ directory is missing!"
+  ls -la
+  exit 1
+fi
 
-      # Repo history (If needed for merge-base)
-      git fetch --all --prune --tags || true
+missing=0
+for f in "${RULES[@]}"; do
+  if [ ! -f "$RULE_DIR/$f" ]; then
+    echo "❌ Missing rule file: $RULE_DIR/$f"
+    missing=1
+  fi
+done
+[ "$missing" -eq 0 ] || exit 1
 
-      # 1) Try the last successful build as baseline
-      if [ -n "${GIT_PREVIOUS_SUCCESSFUL_COMMIT:-}" ]; then
-        BASELINE="$GIT_PREVIOUS_SUCCESSFUL_COMMIT"
-        echo "🟢 Baseline = last successful build: $BASELINE"
-      else
-        # 2) Fallback to merge-base with target (default master)
-        TARGET="${CHANGE_TARGET:-master}"
-        git fetch origin "$TARGET:$TARGET" || true
-        BASELINE="$(git merge-base "$TARGET" HEAD)"
-        echo "🟡 Baseline fallback = merge-base($TARGET, HEAD): $BASELINE"
-      fi
+# Repo history (for baseline)
+git fetch --all --prune --tags || true
 
-      # Show local diffs (helps Semgrep baseline debugging)
-      if ! git diff --quiet; then
-        echo "ℹ️ Workspace has unstaged changes; showing diff for debugging:"
-        git status
-        git diff --stat || true
-      fi
+# Baseline: last successful build or merge-base with target
+if [ -n "${GIT_PREVIOUS_SUCCESSFUL_COMMIT:-}" ]; then
+  BASELINE="$GIT_PREVIOUS_SUCCESSFUL_COMMIT"
+  echo "🟢 Baseline = last successful build: $BASELINE"
+else
+  TARGET="${CHANGE_TARGET:-master}"
+  git fetch origin "$TARGET:$TARGET" || true
+  BASELINE="$(git merge-base "$TARGET" HEAD)"
+  echo "🟡 Baseline fallback = merge-base($TARGET, HEAD): $BASELINE"
+fi
 
-      git rev-parse --verify "$BASELINE" >/dev/null
+# Show local diffs (debug)
+if ! git diff --quiet; then
+  echo "ℹ️ Workspace has unstaged changes; showing diff for debugging:"
+  git status
+  git diff --stat || true
+fi
 
-      # Run each ruleset separately (alerts-only)
-      for f in "${RULES[@]}"; do
-        echo ""
-        echo "=============================="
-        echo "▶️  Semgrep scanning: $RULE_DIR/$f"
-        echo "=============================="
-        docker run --rm -v "$PWD:/src" -w /src \
-          -e SEMGREP_BASELINE_COMMIT="$BASELINE" \
-          returntocorp/semgrep:latest \
-            semgrep scan --metrics=off --config="/src/$RULE_DIR/$f" || true
-      done
-    '''
+git rev-parse --verify "$BASELINE" >/dev/null
+
+# Run each ruleset separately (alerts-only)
+for f in "${RULES[@]}"; do
+  echo ""
+  echo "=============================="
+  echo "▶️  Semgrep scanning: $RULE_DIR/$f"
+  echo "=============================="
+  docker run --rm -v "$PWD:/src" -w /src \
+    -e SEMGREP_BASELINE_COMMIT="$BASELINE" \
+    returntocorp/semgrep:latest \
+      semgrep scan --metrics=off --config="/src/$RULE_DIR/$f" || true
+done
+'''
   }
 }
-
 
     stage('Build Docker image') {
       steps {
@@ -195,6 +192,7 @@ pipeline {
       }
     }
   } 
+
 
   post {
     success {
