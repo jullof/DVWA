@@ -56,6 +56,7 @@ pipeline {
  stage('Semgrep (SAST - alerts only)') {
   steps {
     sh '''
+      #!/use/bin/env bash
       set -euo pipefail
       echo "🔍 Checking Semgrep rules exist..."
 
