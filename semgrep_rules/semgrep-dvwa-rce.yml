@@ -1,0 +1,60 @@
+rules:
+  
+  # 1) RCE (PHP): user input → command execution sinks (taint)
+  
+  - id: rce.taint.php.user_to_exec
+    languages: [php]
+    severity: ERROR
+    mode: taint
+    message: User-controlled data flows into command execution.
+    metadata:
+      category: "RCE"
+    pattern-sources:
+      - pattern: $_GET[$P]
+      - pattern: $_POST[$P]
+      - pattern: $_REQUEST[$P]
+    pattern-sanitizers:
+      - pattern: $X = escapeshellarg($S)
+      - pattern: $X = escapeshellcmd($S)
+      - pattern: $X = filter_var($S, FILTER_VALIDATE_IP, ...)
+      - pattern: preg_match('/^(\d{1,3}\.){3}\d{1,3}$/', $S)
+    pattern-sinks:
+      - pattern: shell_exec($S)
+      - pattern: system($S)
+      - pattern: exec($S)
+      - pattern: passthru($S)
+      - pattern: popen($S, ...)
+      - pattern: proc_open($S, ...)
+      - pattern: `$S`
+
+  
+  # 2) RCE (PHP): direct backticks / popen / proc_open with superglobals
+  #    (concise non-taint catch for common dynamic execution forms)
+  
+  - id: rce.direct.php.backticks_popen_procopen
+    languages: [php]
+    severity: ERROR
+    message: Command execution via backticks/popen/proc_open using user input.
+    metadata:
+      category: "RCE"
+    pattern-either:
+      - pattern: |
+          $OUT = `... $_(GET|POST|REQUEST)[$K] ...`;
+      - pattern: popen(... $_(GET|POST|REQUEST)[$K] ..., ...)
+      - pattern: proc_open(... $_(GET|POST|REQUEST)[$K] ..., ...)
+
+  
+  # 3) RCE (PHP): no IP validation before execution 
+  - id: rce.heur.php.ip_no_validate
+    languages: [php]
+    severity: WARNING
+    message: IP from user is used in a command without FILTER_VALIDATE_IP allowlist check.
+    metadata:
+      category: "RCE"
+    patterns:
+      - pattern-inside: |
+          $ip = $_(GET|POST|REQUEST)['ip'];
+          ...
+          (shell_exec|system|exec|passthru)($CMD . $ip);
+      - pattern-not: |
+          filter_var($ip, FILTER_VALIDATE_IP, ...);

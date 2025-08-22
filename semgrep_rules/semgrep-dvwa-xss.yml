@@ -1,0 +1,66 @@
+rules:
+
+  # 1) Reflected XSS (PHP): user input → HTML sinks (taint)
+  
+  - id: xss.taint.php.user_to_html
+    languages: [php]
+    severity: ERROR
+    mode: taint
+    message: User-controlled data flows into HTML output without proper encoding.
+    metadata:
+      category: "XSS"
+    pattern-sources:
+      - pattern: $_GET[$P]
+      - pattern: $_POST[$P]
+      - pattern: $_REQUEST[$P]
+      - pattern: $_SERVER['PHP_SELF']
+    pattern-sanitizers:
+      - pattern: htmlspecialchars($S, ...)
+      - pattern: htmlentities($S, ...)
+      - pattern: strip_tags($S, ...)
+    pattern-sinks:
+      - pattern: echo $S
+      - pattern: print $S
+      - pattern: printf(..., $S, ...)
+
+  # 2) Warning for XSS (PHP): echoing DB row values without encoding
+  
+  - id: xss.heur.php.db_row_echo
+    languages: [php]
+    severity: WARNING
+    message: Possible Stored XSS: DB row/column echoed without encoding.
+    metadata:
+      category: "XSS"
+    patterns:
+      - pattern-either:
+          - pattern: echo $ROW[$C]
+          - pattern: print $ROW[$C]
+    pattern-not: |
+      (echo|print)(... (htmlspecialchars|htmlentities|strip_tags)\( $ROW\[$C\] ... \) ... )
+
+  # 3) DOM XSS (JS/TS): URL/referrer/cookie → HTML/JS sinks (taint)
+  
+  - id: xss.taint.dom.url_to_html
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    message: DOM XSS: user-controlled URL parts flow into HTML/JS sinks.
+    metadata:
+      category: "XSS"
+    pattern-sources:
+      - pattern: location.search
+      - pattern: location.hash
+      - pattern: document.location.search
+      - pattern: document.location.hash
+      - pattern: document.referrer
+      - pattern: document.cookie
+      - pattern: new URLSearchParams(location.search).get($P)
+    pattern-sinks:
+      - pattern: document.write($S)
+      - pattern: document.writeln($S)
+      - pattern: $E.innerHTML = $S
+      - pattern: $E.outerHTML = $S
+      - pattern: $E.insertAdjacentHTML($POS, $S)
+      - pattern: eval($S)
+      - pattern: setTimeout($S, ...)
+      - pattern: setInterval($S, ...)

@@ -1,0 +1,66 @@
+rules:
+
+- id: sqli.taint.php.user_to_query
+  languages: [php]
+  severity: ERROR
+  mode: taint
+  message: User-controlled data flows into raw SQL query execution (possible SQL Injection).
+  metadata:
+    category: "SQLi"
+    source_example: "$result = mysqli_query($db, 'SELECT * FROM users WHERE id=' . $_GET['id']);"
+  pattern-sources:
+    - pattern: $_GET[$P]
+    - pattern: $_POST[$P]
+    - pattern: $_REQUEST[$P]
+  pattern-sanitizers:
+    # common sanitization/escaping functions
+    - pattern: intval($S)
+    - pattern: floatval($S)
+    - pattern: mysqli_real_escape_string($DB, $S)
+    - pattern: addslashes($S)
+    - pattern: $DB->real_escape_string($S)
+    # PDO prepared statements (safe)
+    - pattern: $PDO->prepare($Q)
+  pattern-sinks:
+    # classic procedural APIs
+    - pattern: mysqli_query($DB, $Q)
+    - pattern: mysql_query($Q)
+    - pattern: pg_query($DB, $Q)
+    # OOP style
+    - pattern: $DB->query($Q)
+    - pattern: $DB->exec($Q)
+    # PDO direct exec (unsafe)
+    - pattern: $PDO->query($Q)
+    - pattern: $PDO->exec($Q)
+
+  # 2) SQLi (PHP): direct superglobal concatenated into query string
+
+  - id: sqli.direct.php.superglobal_in_query
+    languages: [php]
+    severity: ERROR
+    message: SQL query directly includes user input from superglobals.
+    metadata:
+      category: "SQLi"
+    pattern-either:
+      - pattern: mysqli_query(... "..." . $_(GET|POST|REQUEST)[$K] . "...")
+      - pattern: mysql_query("..." . $_(GET|POST|REQUEST)[$K] . "...")
+      - pattern: $DB->query("..." . $_(GET|POST|REQUEST)[$K] . "...")
+      - pattern: $PDO->query("..." . $_(GET|POST|REQUEST)[$K] . "...")
+
+  # 3) SQLi (PHP): heuristic — variable with concat used in query
+
+- id: sqli.heur.php.concat_variable
+  languages: [php]
+  severity: WARNING
+  message: SQL query built via string concatenation — check if sanitized.
+  metadata:
+    category: "SQLi"
+  patterns:
+    - pattern-inside: |
+        $SQL = "..." . $V . "...";
+        ...
+        (mysqli_query|mysql_query|pg_query|$DB->query|$PDO->query)($SQL);
+    - pattern: $SQL = "..." . $V . "...";
+  pattern-not: |
+    $V = (intval|floatval|mysqli_real_escape_string|addslashes|$DB->real_escape_string)($S)
+

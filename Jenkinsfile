@@ -53,30 +53,73 @@ pipeline {
       }
     }
 
-   stage('Semgrep (SAST - alerts only)') {
+ stage('Semgrep (SAST - alerts only)') {
   steps {
     sh '''
-      set -e
-      echo "🔍 Checking if semgrep.yml exists before scanning..."
+      set -euo pipefail
+      echo "🔍 Checking Semgrep rules exist..."
 
-      # Check file on Jenkins host
-      if [ ! -f semgrep.yml ]; then
-        echo "❌ semgrep.yml missing in Jenkins workspace!"
-        ls -l
+      RULE_DIR="semgrep_rules"
+      RULES=(
+        "semgrep-dvwa-xss.yml"
+        "semgrep-dvwa-rce.yml"
+        "semgrep-dvwa-sql.yml"
+      )
+
+      if [ ! -d "$RULE_DIR" ]; then
+        echo "❌ $RULE_DIR/ directory is missing in Jenkins workspace!"
+        ls -la
         exit 1
       fi
 
-      # Check inside Docker container
-      docker run --rm -v "$PWD:/src" -w /src returntocorp/semgrep:latest \
-        ls -l /src/semgrep.yml || { echo "❌ semgrep.yml not visible inside container!"; exit 1; }
+      missing=0
+      for f in "${RULES[@]}"; do
+        if [ ! -f "$RULE_DIR/$f" ]; then
+          echo "❌ Missing rule file: $RULE_DIR/$f"
+          missing=1
+        fi
+      done
+      [ "$missing" -eq 0 ] || exit 1
 
-      echo "✅ semgrep.yml found. Running scan..."
+      # Repo history (If needed for merge-base)
+      git fetch --all --prune --tags || true
 
-      docker run --rm -v "$PWD:/src" -w /src returntocorp/semgrep:latest \
-        semgrep scan --metrics=off --config=/src/semgrep.yml || true
+      # 1) Try the last successful build as baseline
+      if [ -n "${GIT_PREVIOUS_SUCCESSFUL_COMMIT:-}" ]; then
+        BASELINE="$GIT_PREVIOUS_SUCCESSFUL_COMMIT"
+        echo "🟢 Baseline = last successful build: $BASELINE"
+      else
+        # 2) Fallback to merge-base with target (default master)
+        TARGET="${CHANGE_TARGET:-master}"
+        git fetch origin "$TARGET:$TARGET" || true
+        BASELINE="$(git merge-base "$TARGET" HEAD)"
+        echo "🟡 Baseline fallback = merge-base($TARGET, HEAD): $BASELINE"
+      fi
+
+      # Show local diffs (helps Semgrep baseline debugging)
+      if ! git diff --quiet; then
+        echo "ℹ️ Workspace has unstaged changes; showing diff for debugging:"
+        git status
+        git diff --stat || true
+      fi
+
+      git rev-parse --verify "$BASELINE" >/dev/null
+
+      # Run each ruleset separately (alerts-only)
+      for f in "${RULES[@]}"; do
+        echo ""
+        echo "=============================="
+        echo "▶️  Semgrep scanning: $RULE_DIR/$f"
+        echo "=============================="
+        docker run --rm -v "$PWD:/src" -w /src \
+          -e SEMGREP_BASELINE_COMMIT="$BASELINE" \
+          returntocorp/semgrep:latest \
+            semgrep scan --metrics=off --config="/src/$RULE_DIR/$f" || true
+      done
     '''
   }
 }
+
 
     stage('Build Docker image') {
       steps {
