@@ -59,48 +59,29 @@ stage('Semgrep (SAST - alerts only)') {
 set -eu
 
 echo "🔍 Checking Semgrep rules exist..."
-
 RULE_DIR="semgrep_rules"
-RULES="$(ls -1 "$RULE_DIR"/*.yml "$RULE_DIR"/*.yml 2>/dev/null || true)"
+RULES="$(ls -1 "$RULE_DIR"/*.yml "$RULE_DIR"/*.yaml 2>/dev/null | sort -u || true)"
 [ -n "$RULES" ] || { echo "❌ No rule files found in $RULE_DIR"; exit 1; }
-
-missing=0
-for f in $RULES; do
-  [ -f "$f" ] || { echo "❌ Missing: $f"; missing=1; }
-done
-[ "$missing" -eq 0 ] || exit 1
-
-for f in $RULES; do
-  echo "▶️  Semgrep scanning: $f"
-  docker run --rm -v "$PWD:/src" -w /src \
-    -e SEMGREP_BASELINE_COMMIT="$BASELINE" \
-    returntocorp/semgrep:latest \
-      semgrep scan --metrics=off --config="/src/$f" || true
-done
-
-[ "$missing" -eq 0 ] || exit 1
 
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "❌ .git not found"; exit 1; }
 git fetch --all --prune --tags || true
 
-if [ -n "${GIT_PREVIOUS_SUCCESSFUL_COMMIT:-}" ]; then
+BASELINE=""
+if [ -n "${GIT_PREVIOUS_SUCCESSFUL_COMMIT:-}" ] && git rev-parse -q --verify "$GIT_PREVIOUS_SUCCESSFUL_COMMIT" >/dev/null; then
   BASELINE="$GIT_PREVIOUS_SUCCESSFUL_COMMIT"
-  echo "🟢 Baseline = last successful build: $BASELINE"
+  echo "🟢 Using last successful commit as baseline: $BASELINE"
 else
-  TARGET="${CHANGE_TARGET:-master}"
-  git fetch origin "$TARGET:$TARGET" || true
-  BASELINE="$(git merge-base "$TARGET" HEAD || true)"
-  if [ -z "$BASELINE" ]; then
-    # merge-base bulunamazsa HEAD~1'e düş
-    BASELINE="$(git rev-parse HEAD~1 || true)"
-  fi
-  echo "🟡 Baseline fallback: $BASELINE"
+  echo "⚠️ No previous successful build commit available; running without baseline"
 fi
 
-git rev-parse --verify "$BASELINE" >/dev/null
+if [ -n "$BASELINE" ]; then
+  ENV_ARGS="-e SEMGREP_BASELINE_COMMIT=$BASELINE"
+else
+  ENV_ARGS=""
+fi
 
 if ! git diff --quiet; then
-  echo "ℹ️ Unstaged changes detected:"
+  echo "ℹ️ Unstaged changes present:"
   git status
   git diff --stat || true
 fi
@@ -108,18 +89,16 @@ fi
 for f in $RULES; do
   echo ""
   echo "=============================="
-  echo "▶️  Semgrep scanning: $RULE_DIR/$f"
+  echo "▶️  Semgrep scanning: $f"
   echo "=============================="
-
-  docker run --rm \
-    -v "$PWD:/src" -w /src \
-    -e SEMGREP_BASELINE_COMMIT="$BASELINE" \
-    returntocorp/semgrep:latest \
-      semgrep scan --metrics=off --config="/src/$RULE_DIR/$f" || true
+  docker run --rm -v "$PWD:/src" -w /src $ENV_ARGS \
+    semgrep/semgrep:latest \
+      semgrep scan --metrics=off --config="/src/$f" || true
 done
 '''
   }
 }
+
 
 
     stage('Build Docker image') {
