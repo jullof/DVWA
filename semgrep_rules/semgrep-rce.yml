@@ -1,60 +1,93 @@
 rules:
-  
   # 1) RCE (PHP): user input → command execution sinks (taint)
-  
   - id: rce.taint.php.user_to_exec
     languages: [php]
     severity: ERROR
     mode: taint
-    message: User-controlled data flows into command execution.
+    message: "User-controlled data flows into command execution."
     metadata:
       category: "RCE"
     pattern-sources:
       - pattern: $_GET[$P]
       - pattern: $_POST[$P]
       - pattern: $_REQUEST[$P]
+    # treat these as sanitizers (when tainted value is wrapped by them)
     pattern-sanitizers:
-      - pattern: $X = escapeshellarg($S)
-      - pattern: $X = escapeshellcmd($S)
-      - pattern: $X = filter_var($S, FILTER_VALIDATE_IP, ...)
+      - pattern: escapeshellarg($S)
+      - pattern: escapeshellcmd($S)
+      - pattern: filter_var($S, FILTER_VALIDATE_IP, ...)
       - pattern: preg_match('/^(\d{1,3}\.){3}\d{1,3}$/', $S)
     pattern-sinks:
       - pattern: shell_exec($S)
-      - pattern: system($S)
-      - pattern: exec($S)
-      - pattern: passthru($S)
+      - pattern: system($S, ...)
+      - pattern: exec($S, ...)
+      - pattern: passthru($S, ...)
       - pattern: popen($S, ...)
       - pattern: proc_open($S, ...)
-      - pattern: `$S`
 
-  
-  # 2) RCE (PHP): direct backticks / popen / proc_open with superglobals
-  #    (concise non-taint catch for common dynamic execution forms)
-  
+  # 2) RCE (PHP): direct backticks / popen / proc_open with superglobals (non-taint)
   - id: rce.direct.php.backticks_popen_procopen
     languages: [php]
     severity: ERROR
-    message: Command execution via backticks/popen/proc_open using user input.
+    message: "Command execution via backticks/popen/proc_open using user input."
     metadata:
       category: "RCE"
     pattern-either:
-      - pattern: |
-          $OUT = `... $_(GET|POST|REQUEST)[$K] ...`;
-      - pattern: popen(... $_(GET|POST|REQUEST)[$K] ..., ...)
-      - pattern: proc_open(... $_(GET|POST|REQUEST)[$K] ..., ...)
+      # A) Backticks — flag generic use (can't reliably AST-match inside)
+      - pattern: '$OUT = `...`;'
+      - pattern: '`...`;'
+      # B) popen(cmd, ...) where cmd contains a superglobal (direct or concat)
+      - patterns:
+          - pattern: popen($CMD, ...)
+          - metavariable-pattern:
+              metavariable: $CMD
+              pattern-either:
+                - pattern: $_GET[$K]
+                - pattern: $_POST[$K]
+                - pattern: $_REQUEST[$K]
+                - pattern: $A . $_GET[$K] . $B
+                - pattern: $A . $_POST[$K] . $B
+                - pattern: $A . $_REQUEST[$K] . $B
+      # C) proc_open(cmd, ..., ...) where cmd contains a superglobal
+      - patterns:
+          - pattern: proc_open($CMD, ..., ...)
+          - metavariable-pattern:
+              metavariable: $CMD
+              pattern-either:
+                - pattern: $_GET[$K]
+                - pattern: $_POST[$K]
+                - pattern: $_REQUEST[$K]
+                - pattern: $A . $_GET[$K] . $B
+                - pattern: $A . $_POST[$K] . $B
+                - pattern: $A . $_REQUEST[$K] . $B
 
-  
-  # 3) RCE (PHP): no IP validation before execution 
+  # 3) RCE (PHP): no IP validation before execution (heuristic)
   - id: rce.heur.php.ip_no_validate
     languages: [php]
     severity: WARNING
-    message: IP from user is used in a command without FILTER_VALIDATE_IP allowlist check.
+    message: "IP from user is used in a command without FILTER_VALIDATE_IP allowlist check."
     metadata:
       category: "RCE"
     patterns:
+      # Assign ip from a superglobal
       - pattern-inside: |
-          $ip = $_(GET|POST|REQUEST)['ip'];
+          $ip = $SRC;
           ...
-          (shell_exec|system|exec|passthru)($CMD . $ip);
-      - pattern-not: |
-          filter_var($ip, FILTER_VALIDATE_IP, ...);
+          $CALL($CMD . $ip, ...);
+      # $SRC must be from GET/POST/REQUEST['ip']
+      - metavariable-pattern:
+          metavariable: $SRC
+          pattern-either:
+            - pattern: $_GET['ip']
+            - pattern: $_POST['ip']
+            - pattern: $_REQUEST['ip']
+      # allow common command exec calls
+      - pattern-either:
+          - pattern: shell_exec($CMD . $ip)
+          - pattern: system($CMD . $ip, ...)
+          - pattern: exec($CMD . $ip, ...)
+          - pattern: passthru($CMD . $ip, ...)
+      # if there is an allowlist check, don't match
+      - pattern-not-either:
+          - pattern: filter_var($ip, FILTER_VALIDATE_IP, ...);
+          - pattern: preg_match('/^(\d{1,3}\.){3}\d{1,3}$/', $ip);

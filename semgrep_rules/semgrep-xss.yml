@@ -6,7 +6,7 @@ rules:
     languages: [php]
     severity: ERROR
     mode: taint
-    message: User-controlled data flows into HTML output without proper encoding.
+    message: "User-controlled data flows into HTML output without proper encoding."
     metadata:
       category: "XSS"
     pattern-sources:
@@ -24,27 +24,34 @@ rules:
       - pattern: printf(..., $S, ...)
 
   # 2) Warning for XSS (PHP): echoing DB row values without encoding
-  
   - id: xss.heur.php.db_row_echo
     languages: [php]
     severity: WARNING
-    message: Possible Stored XSS: DB row/column echoed without encoding.
+    message: "Possible Stored XSS: DB row/column echoed without encoding."
     metadata:
       category: "XSS"
     patterns:
       - pattern-either:
-          - pattern: echo $ROW[$C]
-          - pattern: print $ROW[$C]
-    pattern-not: |
-      (echo|print)(... (htmlspecialchars|htmlentities|strip_tags)\( $ROW\[$C\] ... \) ... )
+          - pattern: echo $ROW[$C];
+          - pattern: print $ROW[$C];
 
+      - pattern-not-either:
+          - pattern: echo htmlspecialchars($ROW[$C], ...);
+          - pattern: echo htmlentities($ROW[$C], ...);
+          - pattern: echo strip_tags($ROW[$C], ...);
+
+          - pattern: print htmlspecialchars($ROW[$C], ...);
+          - pattern: print htmlentities($ROW[$C], ...);
+          - pattern: print strip_tags($ROW[$C], ...);
+
+   
   # 3) DOM XSS (JS/TS): URL/referrer/cookie → HTML/JS sinks (taint)
   
   - id: xss.taint.dom.url_to_html
     languages: [javascript, typescript]
     severity: ERROR
     mode: taint
-    message: DOM XSS: user-controlled URL parts flow into HTML/JS sinks.
+    message: "DOM XSS user-controlled URL parts flow into HTML/JS sinks."
     metadata:
       category: "XSS"
     pattern-sources:
