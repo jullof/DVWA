@@ -18,7 +18,6 @@ rules:
       - pattern: mysqli_real_escape_string($DB, $S)
       - pattern: $DB->real_escape_string($S)
     pattern-sinks:
-      # only change: allow variable arg counts / positions
       - pattern: mysqli_query(..., $Q, ...)
       - pattern: mysql_query($Q, ...)
       - pattern: pg_query(..., $Q, ...)
@@ -27,7 +26,7 @@ rules:
       - pattern: $PDO->query($Q, ...)
       - pattern: $PDO->exec($Q, ...)
 
-  # 2) Direct concats
+  # 2) Direct concat heuristic
   - id: sqli.direct.php.superglobal_in_query
     languages: [php]
     severity: ERROR
@@ -49,7 +48,7 @@ rules:
           - pattern: $PDO->query("...". $_POST[$K] . "...", ...)
           - pattern: $PDO->query("...". $_REQUEST[$K] . "...", ...)
 
-  # 3) Concat variable heuristic — preserve pattern-not, make call 
+  # 3) Concat variable heuristic (minimal variadic + multiple pattern-not)
   - id: sqli.heur.php.concat_variable
     languages: [php]
     severity: WARNING
@@ -69,8 +68,7 @@ rules:
           - pattern: $CALL = $DB->exec
           - pattern: $CALL = $PDO->query
           - pattern: $CALL = $PDO->exec
-      - pattern-not-either:
-          - pattern: $V = intval($S);
-          - pattern: $V = floatval($S);
-          - pattern: $V = mysqli_real_escape_string($DB, $S);
-          - pattern: $V = $DB->real_escape_string($S);
+      - pattern-not: $V = intval($S);
+      - pattern-not: $V = floatval($S);
+      - pattern-not: $V = mysqli_real_escape_string($DB, $S);
+      - pattern-not: $V = $DB->real_escape_string($S);

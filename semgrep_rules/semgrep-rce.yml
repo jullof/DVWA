@@ -11,7 +11,6 @@ rules:
       - pattern: $_GET[$P]
       - pattern: $_POST[$P]
       - pattern: $_REQUEST[$P]
-    # treat these as sanitizers (when tainted value is wrapped by them)
     pattern-sanitizers:
       - pattern: escapeshellarg($S)
       - pattern: escapeshellcmd($S)
@@ -33,10 +32,8 @@ rules:
     metadata:
       category: "RCE"
     pattern-either:
-      # A) Backticks — flag generic use (can't reliably AST-match inside)
       - pattern: '$OUT = `...`;'
       - pattern: '`...`;'
-      # B) popen(cmd, ...) where cmd contains a superglobal (direct or concat)
       - patterns:
           - pattern: popen($CMD, ...)
           - metavariable-pattern:
@@ -48,7 +45,6 @@ rules:
                 - pattern: $A . $_GET[$K] . $B
                 - pattern: $A . $_POST[$K] . $B
                 - pattern: $A . $_REQUEST[$K] . $B
-      # C) proc_open(cmd, ..., ...) where cmd contains a superglobal
       - patterns:
           - pattern: proc_open($CMD, ..., ...)
           - metavariable-pattern:
@@ -69,25 +65,20 @@ rules:
     metadata:
       category: "RCE"
     patterns:
-      # Assign ip from a superglobal
       - pattern-inside: |
           $ip = $SRC;
           ...
           $CALL($CMD . $ip, ...);
-      # $SRC must be from GET/POST/REQUEST['ip']
       - metavariable-pattern:
           metavariable: $SRC
           pattern-either:
             - pattern: $_GET['ip']
             - pattern: $_POST['ip']
             - pattern: $_REQUEST['ip']
-      # allow common command exec calls
       - pattern-either:
           - pattern: shell_exec($CMD . $ip)
           - pattern: system($CMD . $ip, ...)
           - pattern: exec($CMD . $ip, ...)
           - pattern: passthru($CMD . $ip, ...)
-      # if there is an allowlist check, don't match
-      - pattern-not-either:
-          - pattern: filter_var($ip, FILTER_VALIDATE_IP, ...);
-          - pattern: preg_match('/^(\d{1,3}\.){3}\d{1,3}$/', $ip);
+      - pattern-not: filter_var($ip, FILTER_VALIDATE_IP, ...);
+      - pattern-not: preg_match('/^(\d{1,3}\.){3}\d{1,3}$/', $ip);

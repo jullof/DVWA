@@ -1,7 +1,5 @@
 rules:
-
   # 1) Reflected XSS (PHP): user input → HTML sinks (taint)
-  
   - id: xss.taint.php.user_to_html
     languages: [php]
     severity: ERROR
@@ -34,19 +32,14 @@ rules:
       - pattern-either:
           - pattern: echo $ROW[$C];
           - pattern: print $ROW[$C];
+      - pattern-not: echo htmlspecialchars($ROW[$C], ...);
+      - pattern-not: echo htmlentities($ROW[$C], ...);
+      - pattern-not: echo strip_tags($ROW[$C], ...);
+      - pattern-not: print htmlspecialchars($ROW[$C], ...);
+      - pattern-not: print htmlentities($ROW[$C], ...);
+      - pattern-not: print strip_tags($ROW[$C], ...);
 
-      - pattern-not-either:
-          - pattern: echo htmlspecialchars($ROW[$C], ...);
-          - pattern: echo htmlentities($ROW[$C], ...);
-          - pattern: echo strip_tags($ROW[$C], ...);
-
-          - pattern: print htmlspecialchars($ROW[$C], ...);
-          - pattern: print htmlentities($ROW[$C], ...);
-          - pattern: print strip_tags($ROW[$C], ...);
-
-   
   # 3) DOM XSS (JS/TS): URL/referrer/cookie → HTML/JS sinks (taint)
-  
   - id: xss.taint.dom.url_to_html
     languages: [javascript, typescript]
     severity: ERROR
