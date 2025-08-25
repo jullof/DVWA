@@ -17,8 +17,8 @@ rules:
       - pattern: htmlentities($S, ...)
       - pattern: strip_tags($S, ...)
     pattern-sinks:
-      - pattern: echo $S
-      - pattern: print $S
+      - pattern: echo $S;
+      - pattern: print $S;
       - pattern: printf(..., $S, ...)
 
   # 2) Warning for XSS (PHP): echoing DB row values without encoding
