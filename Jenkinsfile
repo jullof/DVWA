@@ -4,22 +4,39 @@ pipeline {
   options {
     timestamps()
     ansiColor('xterm')
-    timeout(time: 20, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    timeout(time: 30, unit: 'HOURS')
   }
 
   environment {
     APP_HOST = '192.168.191.132'
     APP_USER = 'app'
-    SSH_CRED = 'app'                  
+    DEPLOY_DIR = '/opt/dvwa'
+
+    DAST_HOST = '192.168.191.133'
+    DAST_USER = 'dast'
+    DAST_SSH_CRED = 'dast_ssh_cred_id'
+
     IMAGE_NAME = 'dvwa-local'
     IMAGE_TAG  = "${env.BUILD_NUMBER}"
-    DEPLOY_DIR = '/opt/dvwa'
+
+    REPORT_DIR  = 'reports'
+    REPORT_HTML = 'zap_report.html'
+    REPORT_JSON = 'zap_report.json'
+
+    GITHUB_TOKEN_CRED = 'github_token_cred_id'
+    GITHUB_REPO = 'jullof/DVWA'
+
+    TARGET_URL = 'http://127.0.0.1:8080'
+    FAIL_ON_RISK = 'none'
   }
 
   stages {
 
     stage('Checkout') {
       steps {
+        milestone(10)
         checkout([$class: 'GitSCM',
           branches: [[name: '*/master']],
           userRemoteConfigs: [[url: 'https://github.com/jullof/DVWA.git']]
@@ -46,67 +63,38 @@ pipeline {
         withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
             set -e
-            echo "Running Snyk SCA (fail on high) ..."
             SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" test --all-projects --severity-threshold=high
           '''
         }
       }
     }
 
-stage('Semgrep (SAST - alerts only)') {
-  steps {
-    sh '''
+    stage('Semgrep (SAST - alerts only)') {
+      steps {
+        sh '''
 set -eu
-
-echo "🔍 Checking Semgrep rules exist..."
 RULE_DIR="semgrep_rules"
 RULES="$(ls -1 "$RULE_DIR"/*.yml "$RULE_DIR"/*.yaml 2>/dev/null | sort -u || true)"
-[ -n "$RULES" ] || { echo "❌ No rule files found in $RULE_DIR"; exit 1; }
-
-git rev-parse --git-dir >/dev/null 2>&1 || { echo "❌ .git not found"; exit 1; }
+[ -n "$RULES" ] || { echo "No rule files in $RULE_DIR"; exit 1; }
+git rev-parse --git-dir >/dev/null 2>&1 || { echo ".git not found"; exit 1; }
 git fetch --all --prune --tags || true
-
 BASELINE=""
 if [ -n "${GIT_PREVIOUS_SUCCESSFUL_COMMIT:-}" ] && git rev-parse -q --verify "$GIT_PREVIOUS_SUCCESSFUL_COMMIT" >/dev/null; then
   BASELINE="$GIT_PREVIOUS_SUCCESSFUL_COMMIT"
-  echo "🟢 Using last successful commit as baseline: $BASELINE"
-else
-  echo "⚠️ No previous successful build commit available; running without baseline"
 fi
-
-if [ -n "$BASELINE" ]; then
-  ENV_ARGS="-e SEMGREP_BASELINE_COMMIT=$BASELINE"
-else
-  ENV_ARGS=""
-fi
-
-if ! git diff --quiet; then
-  echo "ℹ️ Unstaged changes present:"
-  git status
-  git diff --stat || true
-fi
-
+if [ -n "$BASELINE" ]; then ENV_ARGS="-e SEMGREP_BASELINE_COMMIT=$BASELINE"; else ENV_ARGS=""; fi
 for f in $RULES; do
-  echo ""
-  echo "=============================="
-  echo "▶️  Semgrep scanning: $f"
-  echo "=============================="
-  docker run --rm -v "$PWD:/src" -w /src $ENV_ARGS \
-    semgrep/semgrep:latest \
-      semgrep scan --metrics=off --config="/src/$f" || true
+  docker run --rm -v "$PWD:/src" -w /src $ENV_ARGS semgrep/semgrep:latest semgrep scan --metrics=off --config="/src/$f" || true
 done
 '''
-  }
-}
-
-
+      }
+    }
 
     stage('Build Docker image') {
       steps {
+        milestone(20)
         sh '''
           set -e
-          docker version
-          echo "Building image: ${IMAGE_NAME}:${IMAGE_TAG}"
           docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
         '''
       }
@@ -117,74 +105,167 @@ done
         withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
             set -e
-            echo "Scanning container image with Snyk (fail on >= medium) ..."
-            SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG} \
-              --file=Dockerfile --severity-threshold=medium
+            SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG} --file=Dockerfile --severity-threshold=medium
           '''
         }
       }
     }
 
-    stage('Deliver image to App VM') {
+    stage('Send image to DAST VM') {
       steps {
-        sshagent(credentials: [env.SSH_CRED]) {
+        milestone(30)
+        sshagent(credentials: [env.DAST_SSH_CRED]) {
           sh '''
             set -e
-            echo "Shipping image to ${APP_HOST} ..."
-            docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip | \
-              ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'gunzip | docker load'
+            docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 | ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} 'bunzip2 | docker load'
           '''
         }
       }
     }
 
-    stage('Deploy (docker compose up)') {
+    stage('Run DAST scan on DAST VM') {
+      options { timeout(time: 24, unit: 'HOURS') }
       steps {
-        sshagent(credentials: [env.SSH_CRED]) {
+        milestone(40)
+        sshagent(credentials: [env.DAST_SSH_CRED]) {
+          lock(resource: 'dast-scan') {
+            sh '''
+              set -eux
+              ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} '
+                set -eux
+                mkdir -p ~/dast_wrk
+                docker pull owasp/zap2docker-stable || true
+                docker rm -f app-under-test || true
+                docker run -d --name app-under-test -p 8080:8080 ${IMAGE_NAME}:${IMAGE_TAG}
+                sleep 15
+                docker run --rm --network host -v $HOME/dast_wrk:/zap/wrk:rw owasp/zap2docker-stable zap-baseline.py -t ${TARGET_URL} -r ${REPORT_HTML} -J ${REPORT_JSON} -m 5
+              '
+              mkdir -p ${REPORT_DIR}
+              scp -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST}:dast_wrk/${REPORT_HTML} ${REPORT_DIR}/ || true
+              scp -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST}:dast_wrk/${REPORT_JSON} ${REPORT_DIR}/ || true
+            '''
+          }
+        }
+      }
+      post {
+        always {
+          publishHTML(target: [
+            reportDir: "${REPORT_DIR}",
+            reportFiles: "${REPORT_HTML}",
+            reportName: "ZAP DAST Report",
+            keepAll: true,
+            alwaysLinkToLastBuild: true
+          ])
+          archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: true
+        }
+        unsuccessful {
+          echo 'DAST scan failed or timed out.'
+        }
+      }
+    }
+
+    stage('Parse report & create GitHub issues') {
+      when { expression { fileExists("${REPORT_DIR}/${REPORT_JSON}") } }
+      steps {
+        milestone(45)
+        withCredentials([string(credentialsId: env.GITHUB_TOKEN_CRED, variable: 'GITHUB_TOKEN')]) {
           sh '''
-            set -e
-            echo "Preparing ${DEPLOY_DIR} on ${APP_HOST} ..."
-            ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} "mkdir -p ${DEPLOY_DIR}"
-
-            echo "Copying compose file ..."
-            scp -o StrictHostKeyChecking=no docker-compose.yml \
-                ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/docker-compose.yml
-
-            echo "Compose up ..."
-            ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} "\
-              cd ${DEPLOY_DIR} && \
-              IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} \
-              docker compose up -d --remove-orphans"
+            set -eux
+            export GH_TOKEN="${GITHUB_TOKEN}"
+            ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} -q '.author.login // .committer.login // empty' || true)"
+            export ASSIGNEE
+            python3 - << "PY"
+import json, os, subprocess, sys
+repo   = os.environ["GITHUB_REPO"]
+report = os.path.join(os.environ["REPORT_DIR"], os.environ["REPORT_JSON"])
+fail_on = os.environ.get("FAIL_ON_RISK","none").lower()
+assignee = os.environ.get("ASSIGNEE") or None
+with open(report) as f:
+    data = json.load(f)
+def risk_level(r):
+    return {"informational":0,"low":1,"medium":2,"high":3}.get((r or "").lower(),0)
+alerts = []
+for site in data.get("site", []):
+    for a in site.get("alerts", []):
+        alerts.append({
+            "risk": a.get("risk","Informational"),
+            "title": a.get("alert",""),
+            "url": (a.get("instances") or [{}])[0].get("uri","N/A"),
+            "desc": (a.get("desc") or "").strip(),
+            "solution": (a.get("solution") or "").strip(),
+        })
+def gh_issue(title, body, who):
+    cmd = ["gh","issue","create","-R",repo,"-t",title,"-b",body]
+    if who: cmd += ["-a", who]
+    subprocess.run(cmd, check=False)
+max_risk = 0
+created = 0
+for it in alerts:
+    max_risk = max(max_risk, risk_level(it["risk"]))
+    if it["risk"] not in ("High","Medium"):
+        continue
+    body = f"**Risk:** {it['risk']}\n**URL:** {it['url']}\n\n**Açıklama:**\n{it['desc']}\n\n**Çözüm Önerisi:**\n{it['solution']}"
+    gh_issue(f"[DAST] {it['risk']} - {it['title']}", body, assignee)
+    created += 1
+gate = {"none":99, "medium":2, "high":3}.get(fail_on, 99)
+if max_risk >= gate:
+    sys.exit(2)
+PY
           '''
         }
       }
     }
 
-    stage('Health check') {
+    stage('DAST → App VM: deliver & deploy') {
       steps {
-        sshagent(credentials: [env.SSH_CRED]) {
+        milestone(50)
+        sshagent(credentials: [env.DAST_SSH_CRED]) {
           sh '''
-            set +e
-            echo "Waiting app to respond ..."
-            ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} \
-              "sleep 3 && curl -s -o /dev/null -w '%{http_code}\\n' http://localhost:8080/" | tee http_code.txt
+            set -eux
+            ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} "
+              docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 | ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'bunzip2 | docker load'
+            "
+            scp -o StrictHostKeyChecking=no docker-compose.yml ${DAST_USER}@${DAST_HOST}:~/dast_wrk/docker-compose.yml
+            ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} "
+              ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'mkdir -p ${DEPLOY_DIR}'
+              scp -o StrictHostKeyChecking=no ~/dast_wrk/docker-compose.yml ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/docker-compose.yml
+            "
+            ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} "
+              ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} "
+                set -eux
+                cd ${DEPLOY_DIR}
+                IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} docker compose up -d --remove-orphans
+              "
+            "
+          '''
+        }
+      }
+    }
+
+    stage('Health check (via DAST → APP)') {
+      steps {
+        sshagent(credentials: [env.DAST_SSH_CRED]) {
+          sh '''
+            set -eux
+            ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} "
+              curl -s -o /dev/null -w '%{http_code}
+' http://${APP_HOST}:8080/ || true
+            " | tee http_code.txt
             CODE=$(cat http_code.txt)
             test "$CODE" = "200" || echo "HTTP ${CODE}"
           '''
         }
       }
     }
-  } 
-
+  }
 
   post {
     success {
-      echo "✅ Deployed ${IMAGE_NAME}:${IMAGE_TAG} → http://${APP_HOST}:8080"
-      archiveArtifacts artifacts: 'semgrep.sarif', onlyIfSuccessful: true, allowEmptyArchive: true
+      echo "DAST → Issues → (DAST→APP) Deploy OK: ${IMAGE_NAME}:${IMAGE_TAG}"
     }
     failure {
-      echo "❌ Build/Deploy failed. Check the stage logs."
-      archiveArtifacts artifacts: 'semgrep.sarif', onlyIfSuccessful: false, allowEmptyArchive: true
+      echo "Pipeline failed."
+      archiveArtifacts artifacts: "${REPORT_DIR}/*", allowEmptyArchive: true
     }
   }
 }
