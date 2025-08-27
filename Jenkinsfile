@@ -142,7 +142,7 @@ done
             mkdir -p ~/dast_wrk
             docker pull ghcr.io/zaproxy/zaproxy:stable || true
             docker rm -f app-under-test || true
-            docker run -d --name app-under-test -p 8080:8080 ${IMAGE_NAME}:${IMAGE_TAG}
+            docker run -d --name app-under-test -p 8080:80 ${IMAGE_NAME}:${IMAGE_TAG}
             sleep 15
             docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw \
               ghcr.io/zaproxy/zaproxy:stable \
