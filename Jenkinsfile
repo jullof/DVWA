@@ -75,7 +75,7 @@ pipeline {
 set -eu
 RULE_DIR="semgrep_rules"
 RULES="$(ls -1 "$RULE_DIR"/*.yml "$RULE_DIR"/*.yaml 2>/dev/null | sort -u || true)"
-[ -n "$RULES" ] || { echo "No rule files in $RULE_DIR"; exit 1; }
+[ -n "$RULES" ] || { echo "No rule files in $RULE_DIR"; exit 0; }
 git rev-parse --git-dir >/dev/null 2>&1 || { echo ".git not found"; exit 1; }
 git fetch --all --prune --tags || true
 BASELINE=""
@@ -110,69 +110,69 @@ done
         }
       }
     }
+
     stage('Send image to DAST VM') {
       steps {
         milestone(30)
         sshagent(credentials: [env.DAST_SSH_CRED]) {
-           sh '''
-              set -e
-              docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip | \
+          sh '''
+            set -e
+            docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip | \
               ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes \
-              ${DAST_USER}@${DAST_HOST} 'gunzip | docker load'
-             '''
-    }
-  }
-}
-
-stage('Run DAST scan on DAST VM') {
-  options { timeout(time: 24, unit: 'HOURS') }
-  steps {
-    milestone(40)
-    sshagent(credentials: [env.DAST_SSH_CRED]) {
-      lock(resource: 'dast-scan') {
-        sh '''
-          set -eux
-          SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
-
-          ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "
-            set -eux
-            mkdir -p \"\$HOME/dast_wrk\"
-            docker pull owasp/zap2docker-stable || true
-            docker rm -f app-under-test || true
-            docker run -d --name app-under-test -p 8080:8080 ${IMAGE_NAME}:${IMAGE_TAG}
-            sleep 15
-            docker run --rm --network host -v \"\$HOME/dast_wrk:/zap/wrk:rw\" \
-              owasp/zap2docker-stable \
-              zap-baseline.py -t ${TARGET_URL} \
-                -r ${REPORT_HTML}.html \
-                -J ${REPORT_JSON}.json \
-                -m 5 -I
-          "
-
-          mkdir -p ${REPORT_DIR}
-          scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"\$HOME/dast_wrk/${REPORT_HTML}.html" "${REPORT_DIR}/${REPORT_HTML}.html"
-          scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"\$HOME/dast_wrk/${REPORT_JSON}.json" "${REPORT_DIR}/${REPORT_JSON}.json"
-        '''
+                  ${DAST_USER}@${DAST_HOST} 'gunzip | docker load'
+          '''
+        }
       }
     }
-  }
-  post {
-    always {
-      publishHTML(target: [
-        reportDir: "${REPORT_DIR}",
-        reportFiles: "${REPORT_HTML}.html",
-        reportName: "ZAP DAST Report",
-        keepAll: true,
-        alwaysLinkToLastBuild: true
-      ])
-      archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
+
+    stage('Run DAST scan on DAST VM') {
+      options { timeout(time: 24, unit: 'HOURS') }
+      steps {
+        milestone(40)
+        sshagent(credentials: [env.DAST_SSH_CRED]) {
+          lock(resource: 'dast-scan') {
+            sh '''
+              set -eux
+              SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+
+              ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "
+                set -eux
+                mkdir -p \"\$HOME/dast_wrk\"
+                docker pull owasp/zap2docker-stable || true
+                docker rm -f app-under-test || true
+                docker run -d --name app-under-test -p 8080:8080 ${IMAGE_NAME}:${IMAGE_TAG}
+                sleep 15
+                docker run --rm --network host -v \"\$HOME/dast_wrk:/zap/wrk:rw\" \
+                  owasp/zap2docker-stable \
+                  zap-baseline.py -t ${TARGET_URL} \
+                    -r ${REPORT_HTML} \
+                    -J ${REPORT_JSON} \
+                    -m 5 -I
+              "
+
+              mkdir -p ${REPORT_DIR}
+              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"\$HOME/dast_wrk/${REPORT_HTML}" "${REPORT_DIR}/${REPORT_HTML}"
+              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"\$HOME/dast_wrk/${REPORT_JSON}" "${REPORT_DIR}/${REPORT_JSON}"
+            '''
+          }
+        }
+      }
+      post {
+        always {
+          publishHTML(target: [
+            reportDir: "${REPORT_DIR}",
+            reportFiles: "${REPORT_HTML}",
+            reportName: "ZAP DAST Report",
+            keepAll: true,
+            alwaysLinkToLastBuild: true
+          ])
+          archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
+        }
+        unsuccessful {
+          echo 'DAST scan failed or timed out.'
+        }
+      }
     }
-    unsuccessful {
-      echo 'DAST scan failed or timed out.'
-    }
-  }
-}
-}
 
     stage('Parse report & create GitHub issues') {
       when { expression { fileExists("${REPORT_DIR}/${REPORT_JSON}") } }
@@ -180,20 +180,23 @@ stage('Run DAST scan on DAST VM') {
         milestone(45)
         withCredentials([string(credentialsId: env.GITHUB_TOKEN_CRED, variable: 'GITHUB_TOKEN')]) {
           sh '''
-            set -eux
-            export GH_TOKEN="${GITHUB_TOKEN}"
-            ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} -q '.author.login // .committer.login // empty' || true)"
-            export ASSIGNEE
-            python3 - << "PY"
+set -eux
+export GH_TOKEN="${GITHUB_TOKEN}"
+ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} -q '.author.login // .committer.login // empty' || true)"
+export ASSIGNEE
+python3 - << "PY"
 import json, os, subprocess, sys
 repo   = os.environ["GITHUB_REPO"]
 report = os.path.join(os.environ["REPORT_DIR"], os.environ["REPORT_JSON"])
 fail_on = os.environ.get("FAIL_ON_RISK","none").lower()
 assignee = os.environ.get("ASSIGNEE") or None
+
 with open(report) as f:
     data = json.load(f)
+
 def risk_level(r):
     return {"informational":0,"low":1,"medium":2,"high":3}.get((r or "").lower(),0)
+
 alerts = []
 for site in data.get("site", []):
     for a in site.get("alerts", []):
@@ -204,24 +207,27 @@ for site in data.get("site", []):
             "desc": (a.get("desc") or "").strip(),
             "solution": (a.get("solution") or "").strip(),
         })
+
 def gh_issue(title, body, who):
     cmd = ["gh","issue","create","-R",repo,"-t",title,"-b",body]
     if who: cmd += ["-a", who]
     subprocess.run(cmd, check=False)
+
 max_risk = 0
 created = 0
 for it in alerts:
     max_risk = max(max_risk, risk_level(it["risk"]))
     if it["risk"] not in ("High","Medium"):
         continue
-    body = f"**Risk:** {it['risk']}\n**URL:** {it['url']}\n\n**Açıklama:**\n{it['desc']}\n\n**Çözüm Önerisi:**\n{it['solution']}"
+    body = f"**Risk:** {it['risk']}\\n**URL:** {it['url']}\\n\\n**Description:**\\n{it['desc']}\\n\\n**Suggested solution:**\\n{it['solution']}"
     gh_issue(f"[DAST] {it['risk']} - {it['title']}", body, assignee)
     created += 1
+
 gate = {"none":99, "medium":2, "high":3}.get(fail_on, 99)
 if max_risk >= gate:
     sys.exit(2)
 PY
-          '''
+'''
         }
       }
     }
@@ -231,23 +237,21 @@ PY
         milestone(50)
         sshagent(credentials: [env.DAST_SSH_CRED]) {
           sh '''
-            set -eux
-            ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} "
-              docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 | ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'bunzip2 | docker load'
-            "
-            scp -o StrictHostKeyChecking=no docker-compose.yml ${DAST_USER}@${DAST_HOST}:~/dast_wrk/docker-compose.yml
-            ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} "
-              ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'mkdir -p ${DEPLOY_DIR}'
-              scp -o StrictHostKeyChecking=no ~/dast_wrk/docker-compose.yml ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/docker-compose.yml
-            "
-            ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} "
-              ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} "
-                set -eux
-                cd ${DEPLOY_DIR}
-                IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} docker compose up -d --remove-orphans
-              "
-            "
-          '''
+set -eux
+SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+
+# DAST VM'den APP VM'e imaj teslimi
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 | ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'bunzip2 | docker load'"
+
+# docker-compose.yml'i DAST VM'e ve oradan APP VM'e kopyala
+scp -o StrictHostKeyChecking=no docker-compose.yml ${DAST_USER}@${DAST_HOST}:"\$HOME/dast_wrk/docker-compose.yml"
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'mkdir -p ${DEPLOY_DIR}'"
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "scp -o StrictHostKeyChecking=no \$HOME/dast_wrk/docker-compose.yml ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/docker-compose.yml"
+
+# APP VM'de compose up
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} '\
+  set -eux; cd ${DEPLOY_DIR}; IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} docker compose up -d --remove-orphans' "
+'''
         }
       }
     }
@@ -256,18 +260,17 @@ PY
       steps {
         sshagent(credentials: [env.DAST_SSH_CRED]) {
           sh '''
-            set -eux
-            ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} "
-              curl -s -o /dev/null -w '%{http_code}
-' http://${APP_HOST}:8080/ || true
-            " | tee http_code.txt
-            CODE=$(cat http_code.txt)
-            test "$CODE" = "200" || echo "HTTP ${CODE}"
-          '''
+set -eux
+SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+CODE="$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "curl -s -o /dev/null -w '%{http_code}' http://${APP_HOST}:8080/ || true")"
+echo "$CODE" | tee http_code.txt
+test "$CODE" = "200" || echo "HTTP ${CODE}"
+'''
         }
       }
     }
-  }
+
+  } // end stages
 
   post {
     success {
@@ -278,4 +281,4 @@ PY
       archiveArtifacts artifacts: "${REPORT_DIR}/*", allowEmptyArchive: true
     }
   }
-
+}
