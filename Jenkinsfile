@@ -125,45 +125,53 @@ done
 }
 
     stage('Run DAST scan on DAST VM') {
-      options { timeout(time: 24, unit: 'HOURS') }
-      steps {
-        milestone(40)
-        sshagent(credentials: [env.DAST_SSH_CRED]) {
-          lock(resource: 'dast-scan') {
-            sh '''
-              set -eux
-              ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} '
-                set -eux
-                mkdir -p ~/dast_wrk
-                docker pull owasp/zap2docker-stable || true
-                docker rm -f app-under-test || true
-                docker run -d --name app-under-test -p 8080:8080 ${IMAGE_NAME}:${IMAGE_TAG}
-                sleep 15
-                docker run --rm --network host -v $HOME/dast_wrk:/zap/wrk:rw owasp/zap2docker-stable zap-baseline.py -t ${TARGET_URL} -r ${REPORT_HTML} -J ${REPORT_JSON} -m 5
-              '
-              mkdir -p ${REPORT_DIR}
-              scp -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST}:dast_wrk/${REPORT_HTML} ${REPORT_DIR}/ || true
-              scp -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST}:dast_wrk/${REPORT_JSON} ${REPORT_DIR}/ || true
-            '''
-          }
-        }
-      }
-      post {
-        always {
-          publishHTML(target: [
-            reportDir: "${REPORT_DIR}",
-            reportFiles: "${REPORT_HTML}",
-            reportName: "ZAP DAST Report",
-            keepAll: true,
-            alwaysLinkToLastBuild: true
-          ])
-          archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: true
-        }
-        unsuccessful {
-          echo 'DAST scan failed or timed out.'
-        }
+  options { timeout(time: 24, unit: 'HOURS') }
+  steps {
+    milestone(40)
+    sshagent(credentials: [env.DAST_SSH_CRED]) {
+      lock(resource: 'dast-scan') {
+        sh '''
+          set -eux
+          SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes -o IdentitiesOnly=yes"
+
+          ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} '
+            set -eux
+            mkdir -p "$HOME/dast_wrk"
+            docker pull owasp/zap2docker-stable || true
+            docker rm -f app-under-test || true
+            docker run -d --name app-under-test -p 8080:8080 ${IMAGE_NAME}:${IMAGE_TAG}
+            sleep 15
+            docker run --rm --network host -v "$HOME/dast_wrk:/zap/wrk:rw" \
+              owasp/zap2docker-stable \
+              zap-baseline.py -t ${TARGET_URL} \
+                -r ${REPORT_HTML}.html \
+                -J ${REPORT_JSON}.json \
+                -m 5 -I
+          '
+
+          mkdir -p ${REPORT_DIR}
+          scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"$HOME/dast_wrk/${REPORT_HTML}.html"  "${REPORT_DIR}/${REPORT_HTML}.html"
+          scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"$HOME/dast_wrk/${REPORT_JSON}.json"  "${REPORT_DIR}/${REPORT_JSON}.json"
+        '''
       }
     }
+  }
+  post {
+    always {
+      publishHTML(target: [
+        reportDir: "${REPORT_DIR}",
+        reportFiles: "${REPORT_HTML}.html",
+        reportName: "ZAP DAST Report",
+        keepAll: true,
+        alwaysLinkToLastBuild: true
+      ])
+      archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
+    }
+    unsuccessful {
+      echo 'DAST scan failed or timed out.'
+    }
+  }
+}
 
     stage('Parse report & create GitHub issues') {
       when { expression { fileExists("${REPORT_DIR}/${REPORT_JSON}") } }
