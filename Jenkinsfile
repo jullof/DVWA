@@ -137,12 +137,12 @@ done
 
               ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "
                 set -eux
-                mkdir -p \"\$HOME/dast_wrk\"
+                mkdir -p ~/dast_wrk
                 docker pull owasp/zap2docker-stable || true
                 docker rm -f app-under-test || true
                 docker run -d --name app-under-test -p 8080:8080 ${IMAGE_NAME}:${IMAGE_TAG}
                 sleep 15
-                docker run --rm --network host -v \"\$HOME/dast_wrk:/zap/wrk:rw\" \
+                docker run --rm --network host -v \"~/dast_wrk:/zap/wrk:rw\"\
                   owasp/zap2docker-stable \
                   zap-baseline.py -t ${TARGET_URL} \
                     -r ${REPORT_HTML} \
@@ -151,8 +151,8 @@ done
               "
 
               mkdir -p ${REPORT_DIR}
-              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"\$HOME/dast_wrk/${REPORT_HTML}" "${REPORT_DIR}/${REPORT_HTML}"
-              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"\$HOME/dast_wrk/${REPORT_JSON}" "${REPORT_DIR}/${REPORT_JSON}"
+              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}" "${REPORT_DIR}/${REPORT_HTML}"
+              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}" "${REPORT_DIR}/${REPORT_JSON}"
             '''
           }
         }
