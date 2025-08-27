@@ -115,13 +115,15 @@ done
       steps {
         milestone(30)
         sshagent(credentials: [env.DAST_SSH_CRED]) {
-          sh '''
-            set -e
-            docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 | ssh -o StrictHostKeyChecking=no ${DAST_USER}@${DAST_HOST} 'bunzip2 | docker load'
-          '''
-        }
-      }
+           sh '''
+              set -e
+              docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 | \
+              ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes \
+              ${DAST_USER}@${DAST_HOST} 'bunzip2 | docker load'
+             '''
     }
+  }
+}
 
     stage('Run DAST scan on DAST VM') {
       options { timeout(time: 24, unit: 'HOURS') }
