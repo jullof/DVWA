@@ -110,6 +110,16 @@ done
         }
       }
     }
+    stage('DEBUG: ssh-agent keys') {
+     steps {
+       sshagent(credentials: [env.DAST_SSH_CRED]) {
+        sh '''
+             echo "=== Keys loaded into ssh-agent ==="
+             ssh-add -L
+           '''
+    }
+  }
+}
 
     stage('Send image to DAST VM') {
       steps {
