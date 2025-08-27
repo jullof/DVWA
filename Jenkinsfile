@@ -233,29 +233,34 @@ PY
       }
     }
 
-    stage('DAST → App VM: deliver & deploy') {
-      steps {
-        milestone(50)
-        sshagent(credentials: [env.DAST_SSH_CRED]) {
-          sh '''
-set -eux
-SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+stage('DAST → App VM: deliver & deploy') {
+  steps {
+    milestone(50)
+    sshagent(credentials: [env.DAST_SSH_CRED, env.SSH_CRED]) {
+      sh '''
+        set -euo pipefail
+        SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
-# DAST VM'den APP VM'e imaj teslimi
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 | ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'bunzip2 | docker load'"
+        ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} \
+          'docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip -c' \
+        | ssh $SSH_OPTS ${APP_USER}@${APP_HOST} \
+          'gunzip -c | docker load'
 
-# docker-compose.yml'i DAST VM'e ve oradan APP VM'e kopyala
-scp -o StrictHostKeyChecking=no docker-compose.yml ${DAST_USER}@${DAST_HOST}:"\$HOME/dast_wrk/docker-compose.yml"
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'mkdir -p ${DEPLOY_DIR}'"
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "scp -o StrictHostKeyChecking=no \$HOME/dast_wrk/docker-compose.yml ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/docker-compose.yml"
+        ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "mkdir -p ${DEPLOY_DIR}"
 
-# APP VM'de compose up
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} '\
-  set -eux; cd ${DEPLOY_DIR}; IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} docker compose up -d --remove-orphans' "
-'''
-        }
-      }
+        scp -o StrictHostKeyChecking=no docker-compose.yml \
+            ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/docker-compose.yml
+
+        ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "
+          set -eux
+          cd ${DEPLOY_DIR}
+          IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} docker compose up -d --remove-orphans
+        "
+      '''
     }
+  }
+}
+
 
     stage('Health check (via DAST → APP)') {
       steps {
