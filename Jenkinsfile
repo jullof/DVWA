@@ -184,7 +184,11 @@ done
 set -eux
 export GH_TOKEN="${GITHUB_TOKEN}"
 ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} --jq '.author.login // .committer.login // ""' || true)"
+
+[ -z "$ASSIGNEE" ] && ASSIGNEE="jullof"
+
 export ASSIGNEE
+
 python3 - << "PY"
 import json, os, subprocess, sys
 repo   = os.environ["GITHUB_REPO"]
@@ -236,7 +240,7 @@ PY
 stage('DAST → App VM: deliver & deploy') {
   steps {
     milestone(50)
-    sshagent(credentials: [env.DAST_SSH_CRED, env.SSH_CRED]) {
+    sshagent(credentials: ['dast', 'app']) {
       sh '''
         set -euo pipefail
         SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
