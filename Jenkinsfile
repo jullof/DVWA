@@ -241,27 +241,25 @@ stage('DAST → App VM: deliver & deploy') {
   steps {
     milestone(50)
     sshagent(credentials: ['dast_ssh_cred_id', 'app']) {
-      sh '''
-        set -eu
-        SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+  sh '''#!/usr/bin/env bash
+set -euo pipefail
+SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
-        ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} \
-          'docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip -c' \
-        | ssh $SSH_OPTS ${APP_USER}@${APP_HOST} \
-          'gunzip -c | docker load'
+# Stream image DAST → APP over SSH (gzip)
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip -c" \
+| ssh $SSH_OPTS ${APP_USER}@${APP_HOST} 'gunzip -c | docker load'
 
-        ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "mkdir -p ${DEPLOY_DIR}"
+# Deploy compose file & start
+ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "mkdir -p ${DEPLOY_DIR}"
+scp -o StrictHostKeyChecking=no docker-compose.yml ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/docker-compose.yml
+ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "
+  set -eux
+  cd ${DEPLOY_DIR}
+  IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} docker compose up -d --remove-orphans
+"
+'''
+}
 
-        scp -o StrictHostKeyChecking=no docker-compose.yml \
-            ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/docker-compose.yml
-
-        ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "
-          set -eux
-          cd ${DEPLOY_DIR}
-          IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} docker compose up -d --remove-orphans
-        "
-      '''
-    }
   }
 }
 
