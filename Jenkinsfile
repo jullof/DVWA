@@ -183,7 +183,7 @@ done
           sh '''
 set -eux
 export GH_TOKEN="${GITHUB_TOKEN}"
-ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} -q '.author.login // .committer.login // empty' || true)"
+ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} --jq '.author.login // .committer.login // ""' || true)"
 export ASSIGNEE
 python3 - << "PY"
 import json, os, subprocess, sys
