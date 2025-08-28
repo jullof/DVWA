@@ -240,7 +240,7 @@ PY
 stage('DAST → App VM: deliver & deploy') {
   steps {
     milestone(50)
-    sshagent(credentials: ['dast', 'app']) {
+    sshagent(credentials: ['dast_ssh_cred_id', 'app']) {
       sh '''
         set -euo pipefail
         SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
