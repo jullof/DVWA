@@ -181,112 +181,115 @@ stage('Parse report & create GitHub issues') {
     milestone(45)
     withCredentials([string(credentialsId: env.GITHUB_TOKEN_CRED, variable: 'GITHUB_TOKEN')]) {
       sh '''#!/usr/bin/env bash
-        set -eu
-        export GH_TOKEN="${GITHUB_TOKEN}"
+set -eu
+export GH_TOKEN="${GITHUB_TOKEN}"
 
-        gh --version
-        gh api user >/dev/null 2>&1 || { echo "GH token invalid or gh not installed"; exit 1; }
+gh --version
+gh api user >/dev/null 2>&1 || { echo "GH token invalid or gh not installed"; exit 1; }
 
-        for L in "ZAP" "risk:high" "risk:medium" "risk:low" "risk:informational"; do
-          gh label create "$L" -R "${GITHUB_REPO}" -c "CCCCCC" || true
-        done
+for L in "ZAP" "risk:high" "risk:medium" "risk:low" "risk:informational"; do
+  gh label create "$L" -R "${GITHUB_REPO}" -c "CCCCCC" || true
+done
 
-        ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} --jq '.author.login // .committer.login // ""' || true)"
-        [ -z "$ASSIGNEE" ] && ASSIGNEE="jullof"
-        export ASSIGNEE
+ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} --jq '.author.login // .committer.login // ""' || true)"
+[ -z "$ASSIGNEE" ] && ASSIGNEE="jullof"
+export ASSIGNEE
 
-        python3 - << "PY"
-            import json, os, subprocess, sys
+cat > parse_zap_and_create_issues.py <<'PY'
+import json, os, subprocess, sys
 
-            repo     = os.environ["GITHUB_REPO"]
-            report   = os.path.join(os.environ["REPORT_DIR"], os.environ["REPORT_JSON"])
-            fail_on  = os.environ.get("FAIL_ON_RISK","none").lower()
-            assignee = os.environ.get("ASSIGNEE") or None
+repo     = os.environ["GITHUB_REPO"]
+report   = os.path.join(os.environ["REPORT_DIR"], os.environ["REPORT_JSON"])
+fail_on  = os.environ.get("FAIL_ON_RISK","none").lower()
+assignee = os.environ.get("ASSIGNEE") or None
 
-            def risk_level(r):
-                return {"informational":0,"low":1,"medium":2,"high":3}.get((r or "").lower(),0)
+def risk_level(r):
+    return {"informational":0,"low":1,"medium":2,"high":3}.get((r or "").lower(),0)
 
-            with open(report, "r", encoding="utf-8") as f:
-                data = json.load(f)
+with open(report, "r", encoding="utf-8") as f:
+    data = json.load(f)
 
-            alerts = []
-            for site in data.get("site", []):
-                base = site.get("@name") or site.get("name") or ""
-                for a in site.get("alerts", []):
-                    risk = (a.get("risk") or a.get("riskdesc") or "Informational").split()[0]
-                    name = a.get("alert","")
-                    desc = (a.get("desc") or "").strip()
-                    sol  = (a.get("solution") or "").strip()
-                    inst = a.get("instances") or []
-                    first_url = "N/A"
-                    for i in inst:
-                        u = i.get("uri") or i.get("url")
-                        if u:
-                            first_url = u
-                            break
-                    alerts.append({
-                        "risk": risk,
-                        "title": name,
-                        "url": first_url,
-                        "desc": desc,
-                        "solution": sol,
-                        "base": base,
-                        "count": len(inst),
-                    })
+alerts = []
+for site in data.get("site", []):
+    base = site.get("@name") or site.get("name") or ""
+    for a in site.get("alerts", []):
+        risk = (a.get("risk") or a.get("riskdesc") or "Informational").split()[0]
+        name = a.get("alert","")
+        desc = (a.get("desc") or "").strip()
+        sol  = (a.get("solution") or "").strip()
+        inst = a.get("instances") or []
+        first_url = "N/A"
+        for i in inst:
+            u = i.get("uri") or i.get("url")
+            if u:
+                first_url = u
+                break
+        alerts.append({
+            "risk": risk,
+            "title": name,
+            "url": first_url,
+            "desc": desc,
+            "solution": sol,
+            "base": base,
+            "count": len(inst),
+        })
 
-            max_risk, created = 0, 0
+max_risk, created = 0, 0
 
-            def exists_issue(repo, title):
-                q = f'title:"{title}" state:open label:ZAP'
-                out = subprocess.run(
-                    ["gh","issue","list","-R",repo,"--search",q,"--json","number"],
-                    capture_output=True, text=True
-                )
-                return '"number":' in (out.stdout or "")
+def exists_issue(repo, title):
+    q = f'title:"{title}" state:open label:ZAP'
+    out = subprocess.run(
+        ["gh","issue","list","-R",repo,"--search",q,"--json","number"],
+        capture_output=True, text=True
+    )
+    return '"number":' in (out.stdout or "")
 
-            def create_issue(repo, title, body, labels, assignee):
-                cmd = ["gh","issue","create","-R",repo,"-t",title,"-b",body]
-                for lb in labels:
-                    cmd += ["-l", lb]
-                if assignee:
-                    cmd += ["--assignee", assignee]
-                subprocess.run(cmd, check=True)
+def create_issue(repo, title, body, labels, assignee):
+    cmd = ["gh","issue","create","-R",repo,"-t",title,"-b",body]
+    for lb in labels:
+        cmd += ["-l", lb]
+    if assignee:
+        cmd += ["--assignee", assignee]
+    subprocess.run(cmd, check=True)
 
-            for it in alerts:
-                max_risk = max(max_risk, risk_level(it["risk"]))
-                title = f"[ZAP] {it['title']} - {it['url']} (risk: {it['risk']})"
-                if exists_issue(repo, title):
-                    print("Skip (exists):", title)
-                    continue
-                body = f"""Automated ZAP finding
+for it in alerts:
+    max_risk = max(max_risk, risk_level(it["risk"]))
+    title = f"[ZAP] {it['title']} - {it['url']} (risk: {it['risk']})"
+    if exists_issue(repo, title):
+        print("Skip (exists):", title)
+        continue
+    body = f"""Automated ZAP finding
 
-            **Alert:** {it['title']}
-            **Risk:** {it['risk']}
-            **Base:** {it['base']}
-            **First URL:** {it['url']}
-            **Occurrences:** {it['count']}
+**Alert:** {it['title']}
+**Risk:** {it['risk']}
+**Base:** {it['base']}
+**First URL:** {it['url']}
+**Occurrences:** {it['count']}
 
-            **Description:**
-            {it['desc']}
+**Description:**
+{it['desc']}
 
-            **Suggested solution:**
-            {it['solution']}
-            """
-                labels = ["ZAP", f"risk:{it['risk'].lower()}"]
-                print("Creating:", title)
-                create_issue(repo, title, body, labels, assignee)
-                created += 1
+**Suggested solution:**
+{it['solution']}
+"""
+    labels = ["ZAP", f"risk:{it['risk'].lower()}"]
+    print("Creating:", title)
+    create_issue(repo, title, body, labels, assignee)
+    created += 1
 
-            print(f"Created {created} issues.")
+print(f"Created {created} issues.")
 
-            gate = {"none":99, "medium":2, "high":3}.get(fail_on, 99)
-            if max_risk >= gate:
-                sys.exit(2)
-            PY
-                  '''
+gate = {"none":99, "medium":2, "high":3}.get(fail_on, 99)
+if max_risk >= gate:
+    sys.exit(2)
+PY
+
+python3 parse_zap_and_create_issues.py
+'''
     }
   }
 }
+
 
 
 
