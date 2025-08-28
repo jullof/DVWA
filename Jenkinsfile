@@ -242,7 +242,7 @@ stage('DAST → App VM: deliver & deploy') {
     milestone(50)
     sshagent(credentials: ['dast_ssh_cred_id', 'app']) {
       sh '''
-        set -euo pipefail
+        set -eu
         SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
         ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} \
@@ -270,7 +270,7 @@ stage('DAST → App VM: deliver & deploy') {
       steps {
         sshagent(credentials: [env.DAST_SSH_CRED]) {
           sh '''
-set -eux
+set -eu
 SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 CODE="$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "curl -s -o /dev/null -w '%{http_code}' http://${APP_HOST}:8080/ || true")"
 echo "$CODE" | tee http_code.txt
