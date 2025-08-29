@@ -4,59 +4,106 @@ pipeline {
   options {
     timestamps()
     ansiColor('xterm')
+    disableConcurrentBuilds()             
     buildDiscarder(logRotator(numToKeepStr: '30'))
     timeout(time: 30, unit: 'HOURS')
   }
 
   environment {
-    APP_HOST = '192.168.191.132'
-    APP_USER = 'app'
+    // App VM
+    APP_HOST   = '192.168.191.132'
+    APP_USER   = 'app'
     DEPLOY_DIR = '/opt/dvwa'
 
-    DAST_HOST = '192.168.191.133'
-    DAST_USER = 'dast'
+    // DAST VM
+    DAST_HOST     = '192.168.191.133'
+    DAST_USER     = 'dast'
     DAST_SSH_CRED = 'dast_ssh_cred_id'
 
+    // Image
     IMAGE_NAME = 'dvwa-local'
     IMAGE_TAG  = "${env.BUILD_NUMBER}"
 
+    // Reports
     REPORT_DIR  = 'reports'
     REPORT_HTML = 'zap_report.html'
     REPORT_JSON = 'zap_report.json'
 
+    // GitHub Issues
     GITHUB_TOKEN_CRED = 'github_token_cred_id'
-    GITHUB_REPO = 'jullof/DVWA'
+    GITHUB_REPO       = 'jullof/DVWA'
 
-    TARGET_URL = 'http://127.0.0.1:8080'
+    // ZAP
+    TARGET_URL  = 'http://127.0.0.1:8080'
     FAIL_ON_RISK = 'none'
+
+    // Policy mode env gets set dynamically (abort | freeze)
+    DAST_MODE = 'abort'
   }
 
   stages {
 
-    stage('Cancel older running builds') {
+    // ===== 24h policy management (ABORT -> FREEZE) =====
+    stage('Policy Mode (24h rule)') {
       steps {
         script {
-          def cur = currentBuild.rawBuild
-          def job = cur.getParent()
-          job.getBuilds().each { b ->
-            if (b.isBuilding() && b.getNumber() < cur.getNumber()) {
-              echo "Aborting older build #${b.getNumber()} ..."
-              try {
-                b.doStop()
-                sleep 1
-                if (b.isBuilding()) { b.doKill() }
-              } catch (e) {
-                echo "Could not abort #${b.getNumber()}: ${e}"
-              }
-            }
+          def mode = sh(
+            returnStdout: true, label: 'compute-policy-mode',
+            script: '''
+python3 - <<'PY'
+import json, os, time, sys
+policy_file = "/var/lib/jenkins/dast_policy.json"
+now = int(time.time())
+
+# bootstrap if missing
+if not os.path.exists(policy_file):
+    os.makedirs(os.path.dirname(policy_file), exist_ok=True)
+    with open(policy_file, "w", encoding="utf-8") as f:
+        json.dump({"window_start": now, "mode": "abort"}, f)
+
+# load & maybe transition to freeze after 24h
+with open(policy_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+mode = data.get("mode", "abort")
+ws   = int(data.get("window_start", now))
+
+if mode == "abort" and (now - ws) >= 86400:  # 24h
+    data["mode"] = "freeze"
+    mode = "freeze"
+    with open(policy_file, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+print(mode)
+PY
+''').trim()
+          env.DAST_MODE = mode
+          echo "DAST_MODE=${env.DAST_MODE}"
+        }
+      }
+    }
+
+    // In FREEZE: admit exactly one build; reject new ones immediately (no work done)
+    stage('Admission Control (freeze)') {
+      when { expression { return env.DAST_MODE == 'freeze' } }
+      steps {
+        script {
+          def admitted = false
+          lock(resource: 'dast-freeze-admission', skipIfLocked: true) {
+            admitted = true
+            echo 'Freeze mode: admission granted to this build.'
+          }
+          if (!admitted) {
+            error('Freeze mode active: another build is running. Rejecting this new build.')
           }
         }
       }
     }
 
+
     stage('Checkout') {
       steps {
-        milestone(10)
+        script { if (env.DAST_MODE == 'abort') { milestone(10) } }
         checkout([$class: 'GitSCM',
           branches: [[name: '*/master']],
           userRemoteConfigs: [[url: 'https://github.com/jullof/DVWA.git']]
@@ -112,7 +159,7 @@ done
 
     stage('Build Docker image') {
       steps {
-        milestone(20)
+        script { if (env.DAST_MODE == 'abort') { milestone(20) } }
         sh '''
           set -e
           docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
@@ -133,7 +180,7 @@ done
 
     stage('Send image to DAST VM') {
       steps {
-        milestone(30)
+        script { if (env.DAST_MODE == 'abort') { milestone(30) } }
         sshagent(credentials: [env.DAST_SSH_CRED]) {
           sh '''
             set -e
@@ -148,7 +195,7 @@ done
     stage('Run DAST scan on DAST VM') {
       options { timeout(time: 24, unit: 'HOURS') }
       steps {
-        milestone(40)
+        script { if (env.DAST_MODE == 'abort') { milestone(40) } }
         sh "mkdir -p ${REPORT_DIR}"
 
         sshagent(credentials: [env.DAST_SSH_CRED]) {
@@ -198,7 +245,7 @@ done
     stage('Parse report & create GitHub issues') {
       when { expression { fileExists("${REPORT_DIR}/${REPORT_JSON}") } }
       steps {
-        milestone(45)
+        script { if (env.DAST_MODE == 'abort') { milestone(45) } }
         withCredentials([string(credentialsId: env.GITHUB_TOKEN_CRED, variable: 'GITHUB_TOKEN')]) {
           sh '''#!/usr/bin/env bash
 set -eu
@@ -207,6 +254,7 @@ export GH_TOKEN="${GITHUB_TOKEN}"
 gh --version
 gh api user >/dev/null 2>&1 || { echo "GH token invalid or gh not installed"; exit 1; }
 
+# Ensure labels exist
 for L in "ZAP" "risk:high" "risk:medium" "risk:low" "risk:informational"; do
   gh label create "$L" -R "${GITHUB_REPO}" -c "#cccccc" || true
 done
@@ -306,7 +354,7 @@ PY
 
     stage('DAST → App VM: deliver & deploy') {
       steps {
-        milestone(50)
+        script { if (env.DAST_MODE == 'abort') { milestone(50) } }
         sshagent(credentials: ['dast_ssh_cred_id', 'app']) {
           sh '''#!/usr/bin/env bash
 set -eu
