@@ -6,7 +6,7 @@ pipeline {
   ansiColor('xterm')
   buildDiscarder(logRotator(numToKeepStr: '30'))
   timeout(time: 30, unit: 'HOURS')
-  disableConcurrentBuilds(abortPrevious: true)   
+  disableConcurrentBuilds()   
 }
 
 
@@ -83,6 +83,13 @@ PY
         }
       }
     }
+    stage('Fast gate (abort mode)') {
+      when { expression { env.DAST_MODE == 'abort' } }
+        steps {
+         milestone(1)   
+         echo 'Abort mode: older builds are cut here.'
+  }
+}
 
     // In FREEZE: admit exactly one build; reject new ones immediately (no work done)
     stage('Admission Control (freeze)') {
