@@ -4,7 +4,6 @@ pipeline {
   options {
     timestamps()
     ansiColor('xterm')
-    disableConcurrentBuilds()
     buildDiscarder(logRotator(numToKeepStr: '30'))
     timeout(time: 30, unit: 'HOURS')
   }
@@ -33,6 +32,27 @@ pipeline {
   }
 
   stages {
+
+    stage('Cancel older running builds') {
+      steps {
+        script {
+          def cur = currentBuild.rawBuild
+          def job = cur.getParent()
+          job.getBuilds().each { b ->
+            if (b.isBuilding() && b.getNumber() < cur.getNumber()) {
+              echo "Aborting older build #${b.getNumber()} ..."
+              try {
+                b.doStop()
+                sleep 1
+                if (b.isBuilding()) { b.doKill() }
+              } catch (e) {
+                echo "Could not abort #${b.getNumber()}: ${e}"
+              }
+            }
+          }
+        }
+      }
+    }
 
     stage('Checkout') {
       steps {
@@ -126,61 +146,61 @@ done
     }
 
     stage('Run DAST scan on DAST VM') {
-  options { timeout(time: 24, unit: 'HOURS') }
-  steps {
-    milestone(40)
-    sh "mkdir -p ${REPORT_DIR}"
+      options { timeout(time: 24, unit: 'HOURS') }
+      steps {
+        milestone(40)
+        sh "mkdir -p ${REPORT_DIR}"
 
-    sshagent(credentials: [env.DAST_SSH_CRED]) {
-      lock(resource: 'dast-scan') {
-        sh '''
-          set -eux
-          SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+        sshagent(credentials: [env.DAST_SSH_CRED]) {
+          lock(resource: 'dast-scan') {
+            sh '''
+              set -eux
+              SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
-          ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "
-            set -eux
-            mkdir -p ~/dast_wrk
-            docker pull ghcr.io/zaproxy/zaproxy:stable || true
-            docker rm -f app-under-test || true
-            docker run -d --name app-under-test -p 8080:80 ${IMAGE_NAME}:${IMAGE_TAG}
-            sleep 15
-            docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw \
-              ghcr.io/zaproxy/zaproxy:stable \
-              zap-baseline.py -t ${TARGET_URL} \
-                -r ${REPORT_HTML} \
-                -J ${REPORT_JSON} \
-                -m 5 -I
-          "
+              ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "
+                set -eux
+                mkdir -p ~/dast_wrk
+                docker pull ghcr.io/zaproxy/zaproxy:stable || true
+                docker rm -f app-under-test || true
+                docker run -d --name app-under-test -p 8080:80 ${IMAGE_NAME}:${IMAGE_TAG}
+                sleep 15
+                docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw \
+                  ghcr.io/zaproxy/zaproxy:stable \
+                  zap-baseline.py -t ${TARGET_URL} \
+                    -r ${REPORT_HTML} \
+                    -J ${REPORT_JSON} \
+                    -m 5 -I
+              "
 
-          scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
-          scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
-        '''
+              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
+              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
+            '''
+          }
+        }
+      }
+      post {
+        always {
+          publishHTML(target: [
+            reportDir: "${REPORT_DIR}",
+            reportFiles: "${REPORT_HTML}",
+            reportName: "ZAP DAST Report",
+            keepAll: true,
+            alwaysLinkToLastBuild: true
+          ])
+          archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
+        }
+        unsuccessful {
+          echo 'DAST scan failed or timed out.'
+        }
       }
     }
-  }
-  post {
-    always {
-      publishHTML(target: [
-        reportDir: "${REPORT_DIR}",
-        reportFiles: "${REPORT_HTML}",
-        reportName: "ZAP DAST Report",
-        keepAll: true,
-        alwaysLinkToLastBuild: true
-      ])
-      archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
-    }
-    unsuccessful {
-      echo 'DAST scan failed or timed out.'
-    }
-  }
-}
 
-stage('Parse report & create GitHub issues') {
-  when { expression { fileExists("${REPORT_DIR}/${REPORT_JSON}") } }
-  steps {
-    milestone(45)
-    withCredentials([string(credentialsId: env.GITHUB_TOKEN_CRED, variable: 'GITHUB_TOKEN')]) {
-      sh '''#!/usr/bin/env bash
+    stage('Parse report & create GitHub issues') {
+      when { expression { fileExists("${REPORT_DIR}/${REPORT_JSON}") } }
+      steps {
+        milestone(45)
+        withCredentials([string(credentialsId: env.GITHUB_TOKEN_CRED, variable: 'GITHUB_TOKEN')]) {
+          sh '''#!/usr/bin/env bash
 set -eu
 export GH_TOKEN="${GITHUB_TOKEN}"
 
@@ -188,14 +208,14 @@ gh --version
 gh api user >/dev/null 2>&1 || { echo "GH token invalid or gh not installed"; exit 1; }
 
 for L in "ZAP" "risk:high" "risk:medium" "risk:low" "risk:informational"; do
-  gh label create "$L" -R "${GITHUB_REPO}" -c "CCCCCC" || true
+  gh label create "$L" -R "${GITHUB_REPO}" -c "#cccccc" || true
 done
 
 ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} --jq '.author.login // .committer.login // ""' || true)"
 [ -z "$ASSIGNEE" ] && ASSIGNEE="jullof"
 export ASSIGNEE
 
-cat > parse_zap_and_create_issues.py <<'PY'
+python3 - << "PY"
 import json, os, subprocess, sys
 
 repo     = os.environ["GITHUB_REPO"]
@@ -221,9 +241,7 @@ for site in data.get("site", []):
         first_url = "N/A"
         for i in inst:
             u = i.get("uri") or i.get("url")
-            if u:
-                first_url = u
-                break
+            if u: first_url = u; break
         alerts.append({
             "risk": risk,
             "title": name,
@@ -246,10 +264,8 @@ def exists_issue(repo, title):
 
 def create_issue(repo, title, body, labels, assignee):
     cmd = ["gh","issue","create","-R",repo,"-t",title,"-b",body]
-    for lb in labels:
-        cmd += ["-l", lb]
-    if assignee:
-        cmd += ["--assignee", assignee]
+    for lb in labels: cmd += ["-l", lb]
+    if assignee: cmd += ["--assignee", assignee]
     subprocess.run(cmd, check=True)
 
 for it in alerts:
@@ -283,22 +299,16 @@ gate = {"none":99, "medium":2, "high":3}.get(fail_on, 99)
 if max_risk >= gate:
     sys.exit(2)
 PY
-
-python3 parse_zap_and_create_issues.py
 '''
+        }
+      }
     }
-  }
-}
 
-
-
-
-
-stage('DAST → App VM: deliver & deploy') {
-  steps {
-    milestone(50)
-    sshagent(credentials: ['dast_ssh_cred_id', 'app']) {
-  sh '''#!/usr/bin/env bash
+    stage('DAST → App VM: deliver & deploy') {
+      steps {
+        milestone(50)
+        sshagent(credentials: ['dast_ssh_cred_id', 'app']) {
+          sh '''#!/usr/bin/env bash
 set -eu
 SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
@@ -315,11 +325,9 @@ ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "
   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} docker compose up -d --remove-orphans
 "
 '''
-}
-
-  }
-}
-
+        }
+      }
+    }
 
     stage('Health check (via DAST → APP)') {
       steps {
