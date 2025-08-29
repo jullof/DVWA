@@ -1,13 +1,14 @@
 pipeline {
   agent any
 
-  options {
-    timestamps()
-    ansiColor('xterm')
-    disableConcurrentBuilds()             
-    buildDiscarder(logRotator(numToKeepStr: '30'))
-    timeout(time: 30, unit: 'HOURS')
-  }
+ options {
+  timestamps()
+  ansiColor('xterm')
+  buildDiscarder(logRotator(numToKeepStr: '30'))
+  timeout(time: 30, unit: 'HOURS')
+  disableConcurrentBuilds(abortPrevious: true)   
+}
+
 
   environment {
     // App VM
@@ -199,7 +200,7 @@ done
         sh "mkdir -p ${REPORT_DIR}"
 
         sshagent(credentials: [env.DAST_SSH_CRED]) {
-          lock(resource: 'dast-scan') {
+          lock(resource: 'dast-scan', inversePrecedence: true) {
             sh '''
               set -eux
               SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
@@ -393,13 +394,26 @@ test "$CODE" = "200" || echo "HTTP ${CODE}"
 
   } // end stages
 
-  post {
-    success {
-      echo "DAST → Issues → (DAST→APP) Deploy OK: ${IMAGE_NAME}:${IMAGE_TAG}"
-    }
-    failure {
-      echo "Pipeline failed."
-      archiveArtifacts artifacts: "${REPORT_DIR}/*", allowEmptyArchive: true
+post {
+  aborted {
+    echo 'Build aborted → Cleaning on DAST VM '
+    sshagent(credentials: [env.DAST_SSH_CRED]) {
+      sh '''
+set -eu
+SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "docker rm -f app-under-test || true; rm -rf ~/dast_wrk/* || true"
+'''
     }
   }
+
+  success {
+    echo "DAST → Issues → (DAST→APP) Deploy OK: ${IMAGE_NAME}:${IMAGE_TAG}"
+  }
+
+  failure {
+    echo "Pipeline failed."
+    archiveArtifacts artifacts: "${REPORT_DIR}/*", allowEmptyArchive: true
+  }
+}
+
 }
