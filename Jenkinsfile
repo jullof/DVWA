@@ -82,14 +82,21 @@ PY
         }
       }
     }
-    stage('Fast gate (abort mode)') {
-      when { expression { env.DAST_MODE == 'abort' } }
-        steps {
-         milestone(1)   
-         echo 'Abort mode: older builds are cut here.'
+    stage('Concurrency Policy') {
+  steps {
+    script {
+      if (env.DAST_MODE == 'abort') {
+        // İlk 24 saat: yeni build gelince öncekini abort et
+        properties([disableConcurrentBuilds(abortPrevious: true)])
+        echo 'Concurrency: ABORT mode → abortPrevious=TRUE'
+      } else {
+        // 24h sonrası (freeze): paralel build yok ama öncekini kesme
+        properties([disableConcurrentBuilds()])
+        echo 'Concurrency: FREEZE mode → abortPrevious=FALSE'
+      }
+    }
   }
 }
-
     // In FREEZE: admit exactly one build; reject new ones immediately (no work done)
     stage('Admission Control (freeze)') {
       when { expression { return env.DAST_MODE == 'freeze' } }
