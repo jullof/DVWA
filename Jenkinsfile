@@ -408,15 +408,19 @@ test "$CODE" = "200" || echo "HTTP ${CODE}"
   } // end stages
 
 post {
+  always {
+    sh '''python3 - <<'PY'
+import json, os, time
+policy_file = "/var/lib/jenkins/dast_policy.json"
+os.makedirs(os.path.dirname(policy_file), exist_ok=True)
+with open(policy_file, "w", encoding="utf-8") as f:
+    json.dump({"window_start": int(time.time()), "mode": "abort"}, f)
+print("Policy reset: mode=abort, window_start=now")
+PY'''
+  }
+
   aborted {
     echo 'Build aborted → Cleaning on DAST VM '
-    sshagent(credentials: [env.DAST_SSH_CRED]) {
-      sh '''
-set -eu
-SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "docker rm -f app-under-test || true; rm -rf ~/dast_wrk/* || true"
-'''
-    }
   }
 
   success {
@@ -428,5 +432,6 @@ ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "docker rm -f app-under-test || true; rm
     archiveArtifacts artifacts: "${REPORT_DIR}/*", allowEmptyArchive: true
   }
 }
+
 
 }
