@@ -33,6 +33,13 @@ pipeline {
     GITHUB_TOKEN_CRED = 'github_token_cred_id'
     GITHUB_REPO       = 'jullof/DVWA'
 
+    // AI Part
+    USE_AI       = 'true'
+    SHOW_RECOM   = 'true'
+    AI_THRESHOLD = '0.6'                // 0.0–1.0
+    OPENAI_MODEL = 'gpt-5'
+    OPENAI_BASE  = 'https://api.openai.com/v1/chat/completions'
+
     // ZAP
     TARGET_URL  = 'http://127.0.0.1:8080'
     FAIL_ON_RISK = 'none'
@@ -86,35 +93,18 @@ PY
   steps {
     script {
       if (env.DAST_MODE == 'abort') {
-        // İlk 24 saat: yeni build gelince öncekini abort et
+        // First 24 hour: If new build come abort current one
         properties([disableConcurrentBuilds(abortPrevious: true)])
         echo 'Concurrency: ABORT mode → abortPrevious=TRUE'
       } else {
-        // 24h sonrası (freeze): paralel build yok ama öncekini kesme
+        // After 24 hour (freeze): No parallel built, but don't stop ongoing 
         properties([disableConcurrentBuilds()])
         echo 'Concurrency: FREEZE mode → abortPrevious=FALSE'
       }
     }
   }
 }
-    // In FREEZE: admit exactly one build; reject new ones immediately (no work done)
-    stage('Admission Control (freeze)') {
-      when { expression { return env.DAST_MODE == 'freeze' } }
-      steps {
-        script {
-          def admitted = false
-          lock(resource: 'dast-freeze-admission', skipIfLocked: true) {
-            admitted = true
-            echo 'Freeze mode: admission granted to this build.'
-          }
-          if (!admitted) {
-            error('Freeze mode active: another build is running. Rejecting this new build.')
-          }
-        }
-      }
-    }
-
-
+  
     stage('Checkout') {
       steps {
         script { if (env.DAST_MODE == 'abort') { milestone(10) } }
@@ -144,32 +134,44 @@ PY
         withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
             set -e
-            SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" test --all-projects --severity-threshold=high
-          '''
+            SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" test --all-projects --severity-threshold=high \
+            --json-file-output=${REPORT_DIR}/snyk_sca.json || true
+            '''
         }
       }
     }
 
-    stage('Semgrep (SAST - alerts only)') {
-      steps {
-        sh '''
+    stage('Semgrep (SAST)') {
+  steps {
+    sh '''
 set -eu
 RULE_DIR="semgrep_rules"
-RULES="$(ls -1 "$RULE_DIR"/*.yml "$RULE_DIR"/*.yaml 2>/dev/null | sort -u || true)"
-[ -n "$RULES" ] || { echo "No rule files in $RULE_DIR"; exit 0; }
+mkdir -p ${REPORT_DIR}
+
+if [ ! -d "$RULE_DIR" ]; then
+  echo "No rule dir, skipping"
+  echo '{"results":[]}' > ${REPORT_DIR}/semgrep.json
+  exit 0
+fi
+
 git rev-parse --git-dir >/dev/null 2>&1 || { echo ".git not found"; exit 1; }
 git fetch --all --prune --tags || true
+
 BASELINE=""
 if [ -n "${GIT_PREVIOUS_SUCCESSFUL_COMMIT:-}" ] && git rev-parse -q --verify "$GIT_PREVIOUS_SUCCESSFUL_COMMIT" >/dev/null; then
   BASELINE="$GIT_PREVIOUS_SUCCESSFUL_COMMIT"
 fi
+
 if [ -n "$BASELINE" ]; then ENV_ARGS="-e SEMGREP_BASELINE_COMMIT=$BASELINE"; else ENV_ARGS=""; fi
-for f in $RULES; do
-  docker run --rm -v "$PWD:/src" -w /src $ENV_ARGS semgrep/semgrep:latest semgrep scan --metrics=off --config="/src/$f" || true
-done
+
+docker run --rm -v "$PWD:/src" -w /src $ENV_ARGS semgrep/semgrep:latest \
+  semgrep scan --metrics=off \
+  --config "/src/$RULE_DIR" \
+  --json --output="/src/${REPORT_DIR}/semgrep.json" || true
 '''
-      }
-    }
+  }
+}
+
 
     stage('Build Docker image') {
       steps {
@@ -182,15 +184,18 @@ done
     }
 
     stage('Container scan (Snyk)') {
-      steps {
-        withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
-          sh '''
-            set -e
-            SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG} --file=Dockerfile --severity-threshold=medium
-          '''
-        }
-      }
+  steps {
+    withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
+      sh '''
+set -e
+mkdir -p ${REPORT_DIR}
+SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG} --file=Dockerfile \
+  --json-file-output=${REPORT_DIR}/snyk_container.json || true
+'''
     }
+  }
+}
+
 
     stage('Send image to DAST VM') {
       steps {
@@ -255,116 +260,44 @@ done
         }
       }
     }
-
-    stage('Parse report & create GitHub issues') {
-      when { expression { fileExists("${REPORT_DIR}/${REPORT_JSON}") } }
+    stage('Collect & Normalize findings') {
+      when {
+        expression { env.USE_AI == 'true' }
+      }
       steps {
-        script { if (env.DAST_MODE == 'abort') { milestone(45) } }
-        withCredentials([string(credentialsId: env.GITHUB_TOKEN_CRED, variable: 'GITHUB_TOKEN')]) {
-          sh '''#!/usr/bin/env bash
-set -eu
-export GH_TOKEN="${GITHUB_TOKEN}"
+        sh '''set -eu
+python3 collector_normalize.py
+'''
+      }
+    }
 
-gh --version
-gh api user >/dev/null 2>&1 || { echo "GH token invalid or gh not installed"; exit 1; }
-
-# Ensure labels exist
-for L in "ZAP" "risk:high" "risk:medium" "risk:low" "risk:informational"; do
-  gh label create "$L" -R "${GITHUB_REPO}" -c "#cccccc" || true
-done
-
-ASSIGNEE="$(gh api repos/${GITHUB_REPO}/commits/${GIT_COMMIT} --jq '.author.login // .committer.login // ""' || true)"
-[ -z "$ASSIGNEE" ] && ASSIGNEE="jullof"
-export ASSIGNEE
-
-python3 - << "PY"
-import json, os, subprocess, sys
-
-repo     = os.environ["GITHUB_REPO"]
-report   = os.path.join(os.environ["REPORT_DIR"], os.environ["REPORT_JSON"])
-fail_on  = os.environ.get("FAIL_ON_RISK","none").lower()
-assignee = os.environ.get("ASSIGNEE") or None
-
-def risk_level(r):
-    return {"informational":0,"low":1,"medium":2,"high":3}.get((r or "").lower(),0)
-
-with open(report, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-alerts = []
-for site in data.get("site", []):
-    base = site.get("@name") or site.get("name") or ""
-    for a in site.get("alerts", []):
-        risk = (a.get("risk") or a.get("riskdesc") or "Informational").split()[0]
-        name = a.get("alert","")
-        desc = (a.get("desc") or "").strip()
-        sol  = (a.get("solution") or "").strip()
-        inst = a.get("instances") or []
-        first_url = "N/A"
-        for i in inst:
-            u = i.get("uri") or i.get("url")
-            if u: first_url = u; break
-        alerts.append({
-            "risk": risk,
-            "title": name,
-            "url": first_url,
-            "desc": desc,
-            "solution": sol,
-            "base": base,
-            "count": len(inst),
-        })
-
-max_risk, created = 0, 0
-
-def exists_issue(repo, title):
-    q = f'title:"{title}" state:open label:ZAP'
-    out = subprocess.run(
-        ["gh","issue","list","-R",repo,"--search",q,"--json","number"],
-        capture_output=True, text=True
-    )
-    return '"number":' in (out.stdout or "")
-
-def create_issue(repo, title, body, labels, assignee):
-    cmd = ["gh","issue","create","-R",repo,"-t",title,"-b",body]
-    for lb in labels: cmd += ["-l", lb]
-    if assignee: cmd += ["--assignee", assignee]
-    subprocess.run(cmd, check=True)
-
-for it in alerts:
-    max_risk = max(max_risk, risk_level(it["risk"]))
-    title = f"[ZAP] {it['title']} - {it['url']} (risk: {it['risk']})"
-    if exists_issue(repo, title):
-        print("Skip (exists):", title)
-        continue
-    body = f"""Automated ZAP finding
-
-**Alert:** {it['title']}
-**Risk:** {it['risk']}
-**Base:** {it['base']}
-**First URL:** {it['url']}
-**Occurrences:** {it['count']}
-
-**Description:**
-{it['desc']}
-
-**Suggested solution:**
-{it['solution']}
-"""
-    labels = ["ZAP", f"risk:{it['risk'].lower()}"]
-    print("Creating:", title)
-    create_issue(repo, title, body, labels, assignee)
-    created += 1
-
-print(f"Created {created} issues.")
-
-gate = {"none":99, "medium":2, "high":3}.get(fail_on, 99)
-if max_risk >= gate:
-    sys.exit(2)
-PY
+    stage('AI Triage & Recommend (GPT-5)') {
+      when {
+        expression { env.USE_AI == 'true' && fileExists("${env.REPORT_DIR}/findings_raw.json") }
+      }
+      steps {
+        withCredentials([string(credentialsId: 'openai_api_key_cred_id', variable: 'OPENAI_API_KEY')]) {
+          sh '''set -eu
+python3 ai_triage.py
 '''
         }
       }
     }
+
+    stage('Publish grouped AI-refined issues') {
+      when {
+        expression { env.USE_AI == 'true' && fileExists("${env.REPORT_DIR}/ai_findings.json") }
+      }
+      steps {
+        withCredentials([string(credentialsId: env.GITHUB_TOKEN_CRED, variable: 'GITHUB_TOKEN')]) {
+          sh '''set -eu
+export GH_TOKEN="${GITHUB_TOKEN}"
+python3 create_issues_grouped.py
+'''
+        }
+      }
+    }
+
 
     stage('DAST → App VM: deliver & deploy') {
       steps {
