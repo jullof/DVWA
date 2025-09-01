@@ -212,54 +212,90 @@ SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG}
     }
 
     stage('Run DAST scan on DAST VM') {
-      options { timeout(time: 24, unit: 'HOURS') }
-      steps {
-        script { if (env.DAST_MODE == 'abort') { milestone(40) } }
-        sh "mkdir -p ${REPORT_DIR}"
+  options { timeout(time: 24, unit: 'HOURS') }
+  environment {
+    ZAP_IMAGE = "owasp/zap2docker-stable"  
+    DVWA_USER = "admin"
+    DVWA_PASS = "password"
+  }
+  steps {
+    script { if (env.DAST_MODE == 'abort') { milestone(40) } }
+    sh "mkdir -p ${REPORT_DIR}"
 
-        sshagent(credentials: [env.DAST_SSH_CRED]) {
-          lock(resource: 'dast-scan', inversePrecedence: true) {
-            sh '''
-              set -eux
-              SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+    sshagent(credentials: [env.DAST_SSH_CRED]) {
+      lock(resource: 'dast-scan', inversePrecedence: true) {
+        sh '''
+          set -eux
+          SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
-              ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "
-                set -eux
-                mkdir -p ~/dast_wrk
-                docker pull ghcr.io/zaproxy/zaproxy:stable || true
-                docker rm -f app-under-test || true
-                docker run -d --name app-under-test -p 8080:80 ${IMAGE_NAME}:${IMAGE_TAG}
-                sleep 15
-                docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw \
-                  ghcr.io/zaproxy/zaproxy:stable \
-                  zap-baseline.py -t ${TARGET_URL} \
-                    -r ${REPORT_HTML} \
-                    -J ${REPORT_JSON} \
-                    -m 5 -I
-              "
+          ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "
+            set -eux
+            mkdir -p ~/dast_wrk
+            docker pull ${ZAP_IMAGE} || true
 
-              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
-              scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
-            '''
-          }
-        }
-      }
-      post {
-        always {
-          publishHTML(target: [
-            reportDir: "${REPORT_DIR}",
-            reportFiles: "${REPORT_HTML}",
-            reportName: "ZAP DAST Report",
-            keepAll: true,
-            alwaysLinkToLastBuild: true
-          ])
-          archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
-        }
-        unsuccessful {
-          echo 'DAST scan failed or timed out.'
-        }
+            docker rm -f app-under-test || true
+            docker run -d --name app-under-test -p 8080:80 ${IMAGE_NAME}:${IMAGE_TAG}
+
+            for i in \$(seq 1 60); do
+              curl -sf ${TARGET_URL}/ >/dev/null && break || sleep 2
+            done
+
+            curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -L ${TARGET_URL}/login.php -o /dev/null || true
+            USER_TOKEN=\\\$(curl -sS -b ~/dast_wrk/cookie.txt ${TARGET_URL}/login.php \\
+                            | sed -n 's/.*name=\\"user_token\\" value=\\"\\([^\\"]*\\)\\".*/\\1/p' | head -n1 || true)
+
+            if [ -n \\"\\$USER_TOKEN\\" ]; then
+              POST_DATA=\\"username=${DVWA_USER}&password=${DVWA_PASS}&Login=Login&user_token=\\$USER_TOKEN\\"
+            else
+              POST_DATA=\\"username=${DVWA_USER}&password=${DVWA_PASS}&Login=Login\\"
+            fi
+            curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt \\
+                 -e ${TARGET_URL}/login.php -d \\"\\$POST_DATA\\" -L ${TARGET_URL}/login.php -o /dev/null
+
+            PHPSESSID=\\\$(awk '\\$6==\\"PHPSESSID\\"{print \\$7}' ~/dast_wrk/cookie.txt | tail -n1 || true)
+            echo \\"Using PHPSESSID=\\$PHPSESSID\\"
+            if [ -z \\"\\$PHPSESSID\\" ]; then echo \\"Cookie failed\\"; fi
+
+            docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw ${ZAP_IMAGE} \\
+              zap-full-scan.py \\
+                -t ${TARGET_URL} \\
+                -r /zap/wrk/${REPORT_HTML} \\
+                -J /zap/wrk/${REPORT_JSON} \\
+                -z \\" 
+                  -config replacer.full_list(0).description=AddCookie
+                  -config replacer.full_list(0).enabled=true
+                  -config replacer.full_list(0).matchtype=REQ_HEADER
+                  -config replacer.full_list(0).matchstr=Cookie
+                  -config replacer.full_list(0).regex=false
+                  -config replacer.full_list(0).replacement=PHPSESSID=\\$PHPSESSID
+                  -config spider.maxDuration=10
+                  -config ascan.maxRuleDurationInMins=10
+                \\" || true
+          "
+
+          scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
+          scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
+        '''
       }
     }
+  }
+  post {
+    always {
+      publishHTML(target: [
+        reportDir: "${REPORT_DIR}",
+        reportFiles: "${REPORT_HTML}",
+        reportName: "ZAP DAST Report",
+        keepAll: true,
+        alwaysLinkToLastBuild: true
+      ])
+      archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
+    }
+    unsuccessful {
+      echo 'DAST scan failed or timed out.'
+    }
+  }
+}
+
     stage('Collect & Normalize findings') {
       when {
         expression { env.USE_AI == 'true' }
