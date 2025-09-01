@@ -296,7 +296,7 @@ scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_D
     }
   }
 }
-}
+
 
     stage('Collect & Normalize findings') {
       when {
@@ -403,6 +403,4 @@ PY'''
     archiveArtifacts artifacts: "${REPORT_DIR}/*", allowEmptyArchive: true
   }
 }
-
-
-
+}
