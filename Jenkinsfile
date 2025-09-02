@@ -225,7 +225,7 @@ set -e
 SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
 ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} \
-  "TARGET_URL='${TARGET_URL}' IMAGE_NAME='${IMAGE_NAME}' IMAGE_TAG='${IMAGE_TAG}' ZAP_IMAGE='${ZAP_IMAGE}' REPORT_HTML='${REPORT_HTML}' REPORT_JSON='${REPORT_JSON}' bash -s" <<'REMOTE'
+  "TARGET_URL=\"${TARGET_URL}\" IMAGE_NAME=\"${IMAGE_NAME}\" IMAGE_TAG=\"${IMAGE_TAG}\" ZAP_IMAGE=\"${ZAP_IMAGE}\" REPORT_HTML=\"${REPORT_HTML}\" REPORT_JSON=\"${REPORT_JSON}\" bash -s" <<'REMOTE'
 set -e
 
 mkdir -p ~/dast_wrk
@@ -240,21 +240,14 @@ for i in $(seq 1 60); do
 done
 
 
-USER_TOKEN=$(curl -sS -b ~/dast_wrk/cookie.txt "${TARGET_URL}/login.php" \
-  | sed -n 's/.*name="user_token" value="\([^"]*\)".*/\1/p' | head -n1 || true)
-
-if [ -n "$USER_TOKEN" ]; then
-  POST_DATA="username=admin&password=password&Login=Login&user_token=$USER_TOKEN"
-else
-  POST_DATA="username=admin&password=password&Login=Login"
-fi
-
+curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -L "${TARGET_URL}/login.php" -o /dev/null || true
 curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt \
-     -e "${TARGET_URL}/login.php" -d "$POST_DATA" \
+     -e "${TARGET_URL}/login.php" \
+     -d "username=admin&password=password&Login=Login" \
      -L "${TARGET_URL}/login.php" -o /dev/null || true
 
 PHPSESSID=$(awk '$6=="PHPSESSID"{print $7}' ~/dast_wrk/cookie.txt | tail -n1 || true)
-echo "PHPSESSID=$PHPSESSID"
+echo "PHPSESSID=${PHPSESSID}"
 
 ZAP_ARGS="
   -config spider.maxDuration=10
@@ -301,7 +294,6 @@ scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_D
     }
   }
 }
-
 
 
 
