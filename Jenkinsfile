@@ -271,45 +271,77 @@ docker run -d --name "$APP" --network "$NET" -p 8080:80 \
     vulnerables/web-dvwa
 }
 
-# Health check 
 for i in $(seq 1 60); do
   curl -sf "${TARGET_URL}/" >/dev/null && { echo "App is up"; break; }
   sleep 2
 done
 
-# ---- DVWA init + force low ----
 CJ=~/dast_wrk/c.txt
 : > "$CJ"
 CURL="curl -sS -L -c $CJ -b $CJ"
+BASE="${TARGET_URL}"
 
 echo ">>> setup.php (create/reset DB)"
-$CURL -e "${TARGET_URL}/setup.php" \
+$CURL -e "$BASE/setup.php" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
   -d "create_db=Create+%2F+Reset+Database" \
-  "${TARGET_URL}/setup.php" >/dev/null || true
+  "$BASE/setup.php" >/dev/null || true
 
-echo ">>> Login "
-$CURL "${TARGET_URL}/login.php" -o ~/dast_wrk/login.html || true
-LTOK=$(grep -oP 'name="user_token"\\s+value="\\K[^"]+' ~/dast_wrk/login.html || true)
+if [ "$($CURL -o /dev/null -w '%{http_code}' "$BASE/login.php")" = "200" ]; then
+  P=""
+elif [ "$($CURL -o /dev/null -w '%{http_code}' "$BASE/dvwa/login.php")" = "200" ]; then
+  P="/dvwa"
+else
+  P=""
+fi
+echo "PATH_PREFIX='$P'"
+
+echo ">>> Fetch login page & token"
+$CURL "$BASE$P/login.php" -o ~/dast_wrk/login.html || true
+LTOK=$(grep -oP 'name=["'\\'']user_token["'\\'']\\s+value=["'\\'']\\K[^"\\'']+' ~/dast_wrk/login.html || true)
+echo "login token: ${LTOK:-<none>}"
+
+echo ">>> Login (with headers, token if present)"
 POST="username=${DVWA_USER}&password=${DVWA_PASS}&Login=Login"
 [ -n "$LTOK" ] && POST="$POST&user_token=$LTOK"
-$CURL -e "${TARGET_URL}/login.php" -d "$POST" "${TARGET_URL}/login.php" >/dev/null || true
+$CURL -e "$BASE$P/login.php" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "$POST" "$BASE$P/login.php" >/dev/null || true
+
+if $CURL "$BASE$P/index.php" | grep -qE "Logout|Welcome"; then
+  echo "LOGIN: OK"
+else
+  echo "LOGIN: FAILED (replacer ile cookie zorlanacak)"
+fi
+
+echo ">>> Get security page & token"
+$CURL "$BASE$P/security.php" -o ~/dast_wrk/sec.html || true
+STOK=$(grep -oP 'name=["'\\'']user_token["'\\'']\\s+value=["'\\'']\\K[^"\\'']+' ~/dast_wrk/sec.html || true)
+echo "security token: ${STOK:-<none>}"
 
 echo ">>> Set DVWA security=low"
-$CURL "${TARGET_URL}/security.php" -o ~/dast_wrk/sec.html || true
-STOK=$(grep -oP 'name="user_token"\\s+value="\\K[^"]+' ~/dast_wrk/sec.html || true)
 SPOST="security=low&seclev_submit=Submit"
 [ -n "$STOK" ] && SPOST="$SPOST&user_token=$STOK"
-$CURL -e "${TARGET_URL}/security.php" -d "$SPOST" "${TARGET_URL}/security.php" >/dev/null || true
+$CURL -e "$BASE$P/security.php" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "$SPOST" "$BASE$P/security.php" >/dev/null || true
 
-LEVEL=$($CURL "${TARGET_URL}/security.php" | grep -oP 'Security level:\\s*\\K\\w+' || true)
+LEVEL_TXT=$($CURL "$BASE$P/security.php" | grep -oP 'Security level:\\s*\\K\\w+' || true)
+if [ "$LEVEL_TXT" != "low" ]; then
+  echo ">>> Fallback GET"
+  [ -z "$STOK" ] && STOK=$($CURL "$BASE$P/security.php" | grep -oP 'name=["'\\'']user_token["'\\'']\\s+value=["'\\'']\\K[^"\\'']+' || true)
+  $CURL "$BASE$P/security.php?security=low&seclev_submit=Submit${STOK:+&user_token=$STOK}" >/dev/null || true
+  LEVEL_TXT=$($CURL "$BASE$P/security.php" | grep -oP 'Security level:\\s*\\K\\w+' || true)
+fi
+
 PHPSESSID=$(awk '$6=="PHPSESSID"{print $7}' "$CJ" | tail -n1 || true)
 SEC=$(awk '$6=="security"{print $7}' "$CJ" | tail -n1 || true)
-echo "Verify -> level=${LEVEL:-unknown} cookie_security=${SEC:-none}"
+echo "Verify -> level=${LEVEL_TXT:-unknown} cookie_security=${SEC:-none} phpsessid=${PHPSESSID:-none}"
 
-echo ">>> Pull ZAP (optional)"
+echo ">>> Pull ZAP"
 docker pull "${ZAP_IMAGE}" || true
 
-echo ">>> ZAP deep scan (Ajax+Spider+Active) with cookie replacer"
+echo ">>> Run ZAP scan"
 docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "${ZAP_IMAGE}" \
   zap-full-scan.py -j \
     -t "${TARGET_URL}" \
@@ -323,13 +355,6 @@ docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "${ZAP_IMAGE}" \
       -config replacer.full_list(0).matchstr=Cookie
       -config replacer.full_list(0).regex=false
       -config replacer.full_list(0).replacement=PHPSESSID=${PHPSESSID}; security=low
-      -config spider.maxDepth=15
-      -config spider.maxDuration=45
-      -config spider.parseComments=true
-      -config spider.parseRobotsTxt=true
-      -config spider.postForm=true
-      -config ascan.maxRuleDurationInMins=25
-      -config ascan.threadPerHost=8
     " || true
 BASH
 
@@ -340,6 +365,7 @@ scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_D
     }
   }
 }
+
 
 
 
