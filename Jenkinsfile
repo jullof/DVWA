@@ -211,87 +211,91 @@ SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG}
       }
     }
 
-    stage('Run DAST scan on DAST VM') {
+    stage('Run DAST scan on DAST VM (deep)') {
   options { timeout(time: 24, unit: 'HOURS') }
   environment {
-    ZAP_IMAGE = 'ghcr.io/zaproxy/zaproxy:stable'
+    DAST_HOST    = '192.168.191.133'
+    APP_HOST     = '192.168.191.132'
+    APP_PORT     = '8080'
+    DVWA_USER    = 'admin'
+    DVWA_PASS    = 'password'
+    IMAGE_NAME   = 'dvwa-local'
+    IMAGE_TAG    = env.IMAGE_TAG ?: '90'
+    SSH_OPTS     = '-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes'
   }
   steps {
-    sh "mkdir -p ${REPORT_DIR}"
-    sshagent(credentials: [env.DAST_SSH_CRED]) {
-      lock(resource: 'dast-scan', inversePrecedence: true) {
-        sh '''#!/usr/bin/env bash
-set -e
-SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
-
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} \
-  "TARGET_URL=\"${TARGET_URL}\" IMAGE_NAME=\"${IMAGE_NAME}\" IMAGE_TAG=\"${IMAGE_TAG}\" ZAP_IMAGE=\"${ZAP_IMAGE}\" REPORT_HTML=\"${REPORT_HTML}\" REPORT_JSON=\"${REPORT_JSON}\" bash -s" <<'REMOTE'
+    script {
+      sh '''
+        set -e
+        mkdir -p reports
+        # Run everything remotely via heredoc to avoid Groovy escaping
+        ssh $SSH_OPTS dast@${DAST_HOST} bash -s <<'EOS'
 set -e
 
-mkdir -p ~/dast_wrk
-docker pull "${ZAP_IMAGE}" || true
+export TARGET_URL="http://127.0.0.1:${APP_PORT}"
+export WORK="/home/dast/dast_wrk"
+mkdir -p "$WORK"
 
-docker rm -f app-under-test || true
-docker run -d --name app-under-test -p 8080:80 "${IMAGE_NAME}:${IMAGE_TAG}"
+echo "[DAST] Pull ZAP image"
+docker pull ghcr.io/zaproxy/zaproxy:stable >/dev/null
 
-# Healthcheck
-for i in $(seq 1 60); do
-  curl -sf "${TARGET_URL}/" >/dev/null && break || sleep 2
+echo "[DAST] Ensure app-under-test network reachability (uses APP VM reverse-proxy or NAT)"
+# Just check the app from DAST VM:
+for i in $(seq 1 30); do
+  code=$(curl -s -o /dev/null -w "%{http_code}" "http://${APP_HOST}:${APP_PORT}/" || true)
+  if [ "$code" != "000" ]; then break; fi
+  sleep 2
 done
 
+echo "[DAST] Get login page and extract CSRF token"
+curl -i -c "$WORK/cookies.txt" -b "$WORK/cookies.txt" -sL "http://${APP_HOST}:${APP_PORT}/login.php" -o "$WORK/login.html"
+token=$(sed -n 's/.*name="user_token" value="\([^"]*\)".*/\1/p' "$WORK/login.html" | head -n1 || true)
 
-curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -L "${TARGET_URL}/login.php" -o /dev/null || true
-curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt \
-     -e "${TARGET_URL}/login.php" \
-     -d "username=admin&password=password&Login=Login" \
-     -L "${TARGET_URL}/login.php" -o /dev/null || true
+echo "[DAST] Login to DVWA (keep cookie)"
+curl -i -c "$WORK/cookies.txt" -b "$WORK/cookies.txt" -e "http://${APP_HOST}:${APP_PORT}/login.php"   -sL "http://${APP_HOST}:${APP_PORT}/login.php"   --data "username=${DVWA_USER}&password=${DVWA_PASS}&Login=Login&user_token=${token}" -o "$WORK/post_login.html"
 
-PHPSESSID=$(awk '$6=="PHPSESSID"{print $7}' ~/dast_wrk/cookie.txt | tail -n1 || true)
-echo "PHPSESSID=${PHPSESSID}"
+# Extract PHPSESSID for ZAP replacer
+PHPSESSID=$(awk '/PHPSESSID/ {print $7}' "$WORK/cookies.txt" | tail -n1 || true)
+echo "PHPSESSID=$PHPSESSID" > "$WORK/session.env"
 
-ZAP_ARGS="
-  -config spider.maxDuration=10
-  -config ascan.maxRuleDurationInMins=10
-"
-if [ -n "$PHPSESSID" ]; then
-  ZAP_ARGS="$ZAP_ARGS
-    -config replacer.full_list(0).description=AddCookie
-    -config replacer.full_list(0).enabled=true
-    -config replacer.full_list(0).matchtype=REQ_HEADER
-    -config replacer.full_list(0).matchstr=Cookie
-    -config replacer.full_list(0).regex=false
-    -config replacer.full_list(0).replacement=PHPSESSID=$PHPSESSID
-  "
-fi
+echo "[DAST] Set DVWA security to low"
+curl -i -c "$WORK/cookies.txt" -b "$WORK/cookies.txt" -sL "http://${APP_HOST}:${APP_PORT}/security.php" -o "$WORK/security.html"
+stoken=$(sed -n 's/.*name="user_token" value="\([^"]*\)".*/\1/p' "$WORK/security.html" | head -n1 || true)
+curl -i -c "$WORK/cookies.txt" -b "$WORK/cookies.txt" -e "http://${APP_HOST}:${APP_PORT}/security.php"   -sL "http://${APP_HOST}:${APP_PORT}/security.php"   --data "security=low&seclev_submit=Submit&user_token=${stoken}" -o /dev/null
 
-docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "${ZAP_IMAGE}" \
-  zap-full-scan.py \
-    -t "${TARGET_URL}" \
-    -r "/zap/wrk/${REPORT_HTML}" \
-    -J "/zap/wrk/${REPORT_JSON}" \
-    -z "$ZAP_ARGS" || true
-REMOTE
+echo "[DAST] Prime site tree"
+for p in "" "vulnerabilities/"          "vulnerabilities/sqli/" "vulnerabilities/exec/" "vulnerabilities/csrf/"          "vulnerabilities/xss_r/" "vulnerabilities/xss_s/" "vulnerabilities/fi/"          "vulnerabilities/upload/" "vulnerabilities/weak_id/" "vulnerabilities/brute/"; do
+  curl -s -c "$WORK/cookies.txt" -b "$WORK/cookies.txt" "http://${APP_HOST}:${APP_PORT}/$p" >/dev/null || true
+done
 
-scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
-scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
-'''
-      }
+echo "[DAST] Run ZAP full scan (deep)"
+docker run --rm --network host   -v "$WORK":/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable   zap-full-scan.py     -t "$TARGET_URL"     -r /zap/wrk/zap_report.html     -J /zap/wrk/zap_report.json     -j     -m 60     -z "
+      -config replacer.full_list(0).description=AddCookie
+      -config replacer.full_list(0).enabled=true
+      -config replacer.full_list(0).matchtype=REQ_HEADER
+      -config replacer.full_list(0).matchstr=Cookie
+      -config replacer.full_list(0).regex=false
+      -config replacer.full_list(0).replacement=PHPSESSID=${PHPSESSID}
+      -config spider.maxDuration=60
+      -config spider.postForm=true
+      -config spider.processForm=true
+      -config scanner.threadPerHost=6
+      -config ascan.maxRuleDurationInMins=20
+      -config ascan.maxScanDurationInMins=0
+      -config ascan.scanHeadersAllRequests=true
+    "
+
+echo "[DAST] Finished. Reports under $WORK"
+ls -l "$WORK"/zap_report.* || true
+EOS
+
+        # Copy reports back from DAST VM
+        scp $SSH_OPTS dast@${DAST_HOST}:/home/dast/dast_wrk/zap_report.html reports/zap_report.html || true
+        scp $SSH_OPTS dast@${DAST_HOST}:/home/dast/dast_wrk/zap_report.json reports/zap_report.json || true
+      '''
     }
-  }
-  post {
-    always {
-      publishHTML(target: [
-        reportDir: "${REPORT_DIR}",
-        reportFiles: "${REPORT_HTML}",
-        reportName: "ZAP DAST Report",
-        keepAll: true,
-        alwaysLinkToLastBuild: true
-      ])
-      archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
-    }
-    unsuccessful {
-      echo 'DAST scan failed or timed out.'
-    }
+    publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: 'reports', reportFiles: 'zap_report.html', reportName: 'ZAP DAST Report'])
+    archiveArtifacts artifacts: 'reports/*.json, reports/*.html', fingerprint: true
   }
 }
 

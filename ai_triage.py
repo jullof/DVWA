@@ -1,256 +1,221 @@
 #!/usr/bin/env python3
-# ai_triage.py 
-import os, json, subprocess, time, urllib.request
+# ai_triage.py (hardened)
+# - Robustly groups findings into XSS / SQLi / RCE / Other
+# - Always writes non-empty ai_bodies.json (so 'Create issues' stage has content)
+# - Optional AI FP triage with safe fallback (env OPENAI_API_KEY optional)
+# - Adds 'class' and 'fp_suspect' fields to ai_findings.json
+
+import os, json, re, hashlib, time, urllib.request
+from collections import defaultdict, Counter
 
 REPORT_DIR = os.environ.get("REPORT_DIR","reports")
 IN_PATH    = os.path.join(REPORT_DIR, "findings_raw.json")
 OUT_PATH   = os.path.join(REPORT_DIR, "ai_findings.json")
 BODIES_OUT = os.path.join(REPORT_DIR, "ai_bodies.json")
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-OPENAI_MODEL   = os.environ.get("OPENAI_MODEL","gpt-5")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY","").strip()
+OPENAI_MODEL   = os.environ.get("OPENAI_MODEL","gpt-4o-mini")
 OPENAI_BASE    = os.environ.get("OPENAI_BASE","https://api.openai.com/v1/chat/completions")
 
-TARGET_URL = os.environ.get("TARGET_URL","http://127.0.0.1:8080")
-APP_HOST   = os.environ.get("APP_HOST","")
-VERIFY_URL = f"http://{APP_HOST}:8080" if APP_HOST else TARGET_URL
+def _lower(s): 
+    return (s or "").lower()
 
-AI_THRESHOLD = float(os.environ.get("AI_THRESHOLD","0.6") or 0.6)
-BUILD_NO     = os.environ.get("BUILD_NUMBER","")
-BUILD_URL    = os.environ.get("BUILD_URL","")
+def classify(f):
+    """Heuristic mapping to classes."""
+    name = _lower(f.get("name") or f.get("title"))
+    plugin = str(f.get("pluginId", ""))
+    cwe = str(f.get("cwe", ""))
+    # XSS
+    if any(k in name for k in ["cross site scripting", "xss"]) or plugin in {"40012","40014","40016","40017","40026"}:
+        return "xss"
+    # SQLi
+    if "sql injection" in name or any(p in plugin for p in ["40018","40019","40020","40021","40022","40024","40027"]):
+        return "sqli"
+    # RCE / Command injection
+    if any(k in name for k in ["remote code execution","os command","command injection","code injection"]) or plugin in {"90020","20018"}:
+        return "rce"
+    return "other"
 
-NEEDS_HEADER = { "10020":"X-Frame-Options","10021":"X-Content-Type-Options","10038":"Content-Security-Policy","10063":"Permissions-Policy" }
-QUICK_FP_DAST = set(["90004"])  # Spectre
+def normalize_severity(s):
+    s = _lower(s)
+    if s in ("0","info","informational"): return "info"
+    if s in ("1","low"): return "low"
+    if s in ("2","medium","moderate"): return "medium"
+    if s in ("3","high"): return "high"
+    if s in ("4","critical","very high","urgent"): return "critical"
+    return "unknown"
 
-def curl_head(url:str)->str:
-    try:
-        out = subprocess.check_output(["curl","-sS","-I","-L",url], timeout=10)
-        return out.decode("utf-8","ignore")
-    except Exception:
-        return ""
+def digest(*parts):
+    h = hashlib.sha1()
+    for p in parts:
+        h.update((_lower(str(p))).encode("utf-8", "ignore"))
+    return h.hexdigest()[:12]
 
-def header_present(head:str, name:str)->bool:
-    name_l = name.lower()
-    for line in head.splitlines():
-        if ":" in line:
-            k,v = line.split(":",1)
-            if k.strip().lower()==name_l:
-                return True
-    return False
+# --- Load raw findings ---
+with open(IN_PATH,"r",encoding="utf-8") as fh:
+    raw = json.load(fh)
 
-SYS_PROMPT = (
-  "You are an AppSec triage assistant. Be conservative; if uncertain, mark as FP or lower confidence. "
-  "Use live header checks when provided. Return ONLY valid JSON for every answer."
-)
+# Accept either list or dict with 'findings'
+if isinstance(raw, dict) and "findings" in raw:
+    items = raw["findings"]
+elif isinstance(raw, list):
+    items = raw
+else:
+    items = []
 
-def _openai_chat(messages, max_tokens=800, temperature=0.1):
-    body = {"model": OPENAI_MODEL, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-    req = urllib.request.Request(
-      OPENAI_BASE, data=json.dumps(body).encode(),
-      headers={"Content-Type":"application/json","Authorization":f"Bearer {OPENAI_API_KEY}"}
-    )
-    with urllib.request.urlopen(req, timeout=45) as resp:
-        data = json.load(resp)
-    return data["choices"][0]["message"]["content"]
+# Ensure dict structure
+norm = []
+for it in items:
+    f = dict(it or {})
+    src = f.get("source") or f.get("scanner") or "unknown"
+    sev = normalize_severity(f.get("severity") or f.get("risk") or f.get("level") or "")
+    url = f.get("url") or f.get("target") or f.get("endpoint") or ""
+    name = f.get("name") or f.get("title") or f.get("rule") or "Finding"
+    pluginId = f.get("pluginId") or f.get("id") or ""
+    evidence = f.get("evidence") or f.get("param") or f.get("evidenceSnippet") or ""
+    cwe = f.get("cwe") or f.get("cweId") or ""
+    klass = classify({"name": name, "pluginId": pluginId, "cwe": cwe})
+    f.update({
+        "source": src,
+        "severity": sev,
+        "url": url,
+        "name": name,
+        "pluginId": pluginId,
+        "evidence": evidence,
+        "cwe": cwe,
+        "class": klass,
+        "id": f.get("id") or f.get("fingerprint") or f"{src}-{pluginId}-{digest(url,name,evidence)}"
+    })
+    norm.append(f)
 
-def build_item_payload(item):
-    schema = {
-      "is_fp":"boolean",
-      "confidence":"0.0-1.0",
-      "why":"short justification",
-      "attack_class":"xss|sqli|rce|other",
-      "recom":"minimal stack-aware fix or empty",
-      "references":"IDs only (e.g., CWE-79, OWASP-ASVS-5.x)"
-    }
-    guard = {
-      "allowed_headers":["Content-Security-Policy","X-Frame-Options","X-Content-Type-Options","Permissions-Policy","Strict-Transport-Security","Referrer-Policy"],
-      "apache_steps":["a2enmod headers","Header always set <Name> \"<Value>\"","ServerTokens Prod","ServerSignature Off"],
-      "php_session":["session.cookie_samesite","session.cookie_httponly","session.cookie_secure","session_set_cookie_params","@ini_set"],
-      "rules":"If live_check.header_missing_confirmed=false, prefer FP with rationale. Map 'command injection' to 'rce'."
-    }
-    ctx = { "App":"DVWA","Runtime":"PHP 8.2 + Apache","TargetBase": VERIFY_URL }
-    return json.dumps({"Context":ctx,"Finding":item,"Schema":schema,"Guardrails":guard}, ensure_ascii=False)
+# Deduplicate (by id)
+seen = set()
+deduped = []
+for f in norm:
+    if f["id"] in seen:
+        continue
+    seen.add(f["id"])
+    deduped.append(f)
 
-def triage_one(item):
-    try:
-        content = _openai_chat(
-            [{"role":"system","content":SYS_PROMPT},
-             {"role":"user","content": build_item_payload(item)}],
-            max_tokens=600, temperature=0.1
+# --- Optional AI-based FP flagging (batched & safe) ---
+def call_openai_batch(samples):
+    if not OPENAI_API_KEY: 
+        return {}
+    # Keep prompt deterministic and bounded
+    prompt = {
+        "role": "system",
+        "content": (
+            "You are a security triage assistant. For each item, decide if it is VERY LIKELY a false positive.\n"
+            "Return *ONLY* a compact JSON object mapping each 'id' to true/false.\n"
+            "Be conservative: if unsure, return false.\n"
         )
-        out = json.loads(content.strip())
-        return {
-          "is_fp": bool(out.get("is_fp",False)),
-          "confidence": float(out.get("confidence",0.0) or 0.0),
-          "why": str(out.get("why","")),
-          "attack_class": str(out.get("attack_class","other")),
-          "recom": str(out.get("recom","")),
-          "references": out.get("references") or []
-        }
-    except Exception as e:
-        return {"is_fp":False,"confidence":0.0,"why":f"llm_error:{e}","attack_class":"other","recom":"","references":[]}
-
-raw = json.load(open(IN_PATH,"r",encoding="utf-8"))
-refined = []
-
-for f in raw.get("findings",[]):
-    live = {"checked":False,"header_missing_confirmed":False,"header_name":""}
-    if f.get("source")=="ZAP" and f.get("rule_id") in NEEDS_HEADER:
-        url = (f.get("location") or {}).get("url") or VERIFY_URL
-        head = curl_head(url)
-        live["checked"] = True
-        live["header_name"] = NEEDS_HEADER[f["rule_id"]]
-        live["header_missing_confirmed"] = not header_present(head, live["header_name"])
-
-    item = {
-      "source": f.get("source"),
-      "type": f.get("type"),
-      "rule_id": f.get("rule_id"),
-      "title": f.get("title"),
-      "severity": f.get("severity"),
-      "location": f.get("location"),
-      "description": f.get("description",""),
-      "evidence": f.get("evidence",""),
-      "cwe": f.get("cwe") or [],
-      "class_hint": f.get("class_hint","other"),
-      "changed_in_diff": bool(f.get("changed_in_diff")),
-      "live_check": live
     }
-
-    tri = triage_one(item)
-
-    if live["checked"] and live["header_missing_confirmed"] is False:
-        tri["is_fp"] = True
-        tri["confidence"] = max(tri["confidence"], 0.8)
-        tri["why"] = (tri.get("why","") + " | live_check: header present").strip(" |")
-
-    if f.get("source")=="ZAP" and f.get("rule_id") in QUICK_FP_DAST and not tri["is_fp"]:
-        tri["confidence"] = min(tri["confidence"], 0.5)
-        tri["why"] = (tri.get("why","") + " | quick_hint: likely benign").strip(" |")
-
-    f["ai"] = tri
-    refined.append(f)
-    time.sleep(0.25)
-
-json.dump({"findings":refined}, open(OUT_PATH,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-print(f"[AI] refined -> {OUT_PATH}; total={len(refined)}")
-
-def build_issue_template():
-    return (
-"""You will craft final GitHub issue bodies per class (XSS, SQLi, RCE, Other) in a strict Markdown template.
-Use ONLY the provided normalized items. Do not invent URLs/files. Keep it concise.
-
-### REQUIRED MARKDOWN TEMPLATE (use literally):
-# <Class Title> — AI-refined Security Findings
-
-**Build:** #<BUILD_NUMBER>  <BUILD_URL>  
-**Generated:** <UTC-ISO>  
-**Scope:** ZAP (DAST) + Semgrep (SAST) + Snyk (SCA)  
-**Policy:** Only AI-refined True Positives (confidence ≥ <AI_THRESHOLD>)
-
----
-
-## Summary
-- Total: <N>  |  High: <H>  |  Medium: <M>  |  Low: <L>  |  Info: <I>
-- Top risks: <top 3 titles or '—'>
-
----
-
-## Findings (sorted by severity desc, confidence desc)
-
-### <Index>. [<Severity>] <Title>
-- **Source/Type:** <ZAP|Semgrep|Snyk> / <dast|sast|sca>  
-- **Location:** <URL | file:line | package | N/A>  
-- **AI:** confidence=<0.00-1.00>  
-- **Why:** <short justification>  
-- **Suggested fix (AI):**  
-  <one-paragraph minimal, stack-aware fix or '—'>  
-- **References:** <CWE/ASVS ids or '—'>
-
-(repeat for all findings)
-
----
-
-## Notes
-- False positives and low-confidence findings are excluded by policy.
-- Header-related DAST rules were live-checked (curl -I).
-"""
-)
-
-def class_title_map():
-    return {
-      "xss":"Security: XSS findings (AI-refined)",
-      "sqli":"Security: SQLi findings (AI-refined)",
-      "rce":"Security: RCE findings (AI-refined)",
-      "other":"Security: Other findings (AI-refined)"
+    user = {
+        "role": "user",
+        "content": json.dumps(
+            [{"id": f["id"], "name": f["name"], "severity": f["severity"], "url": f["url"], "source": f["source"]} for f in samples],
+            ensure_ascii=False
+        )
     }
+    req = json.dumps({
+        "model": OPENAI_MODEL,
+        "messages": [prompt, user],
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+        "max_tokens": 400
+    }).encode("utf-8")
+    try:
+        req_obj = urllib.request.Request(
+            OPENAI_BASE, data=req, method="POST",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+        )
+        with urllib.request.urlopen(req_obj, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = data["choices"][0]["message"]["content"]
+        mapping = json.loads(content) if content.strip().startswith("{") else {}
+        return mapping if isinstance(mapping, dict) else {}
+    except Exception:
+        return {}
 
-def summarize_counts(items):
-    sev = [ (i.get("severity","informational") or "").lower() for i in items ]
-    h = sum(s=="high" for s in sev)
-    m = sum(s=="medium" for s in sev)
-    l = sum(s=="low" for s in sev)
-    i = sum(s=="informational" for s in sev)
-    return {"total":len(items),"high":h,"medium":m,"low":l,"info":i}
+# Batch and flag (but do not drop them yet)
+fp_map = {}
+if OPENAI_API_KEY:
+    batch = []
+    for f in deduped:
+        # Only ask AI for medium+ to save tokens; everything else default false
+        if f["severity"] in {"medium","high","critical"}:
+            batch.append(f)
+            if len(batch) == 25:
+                fp_map.update(call_openai_batch(batch))
+                batch = []
+    if batch:
+        fp_map.update(call_openai_batch(batch))
 
-buckets = {"xss":[],"sqli":[],"rce":[],"other":[]}
-for f in refined:
-    ai = f.get("ai",{})
-    if ai.get("is_fp"): 
-        continue
-    if float(ai.get("confidence",0.0) or 0.0) < AI_THRESHOLD:
-        continue
-    cls = (ai.get("attack_class") or f.get("class_hint","other"))
-    if cls not in buckets: cls="other"
-    # Location string
-    loc = f.get("location") or {}
-    where = loc.get("url") or (f"{loc.get('file')}:{loc.get('line')}" if loc.get('file') else None) or loc.get("package") or "N/A"
-    buckets[cls].append({
-        "severity": f.get("severity","informational"),
-        "title": f.get("title",""),
-        "source": f.get("source"),
-        "type": f.get("type"),
-        "where": where,
-        "confidence": float(ai.get("confidence",0.0) or 0.0),
-        "why": (ai.get("why") or ""),
-        "recom": (ai.get("recom") or ""),
-        "references": ai.get("references") or []
-    })
+for f in deduped:
+    f["fp_suspect"] = bool(fp_map.get(f["id"], False))
 
-payload = {
-  "build": {"number": BUILD_NO, "url": BUILD_URL, "threshold": AI_THRESHOLD},
-  "template": build_issue_template(),
-  "classes": [],
-}
-titles = class_title_map()
-for cls, items in buckets.items():
-    payload["classes"].append({
-      "key": cls, "title": titles[cls],
-      "summary": summarize_counts(items),
-      "items": sorted(items, key=lambda x:({"high":3,"medium":2,"low":1,"informational":0}[x["severity"].lower()], x["confidence"]), reverse=True)
-    })
+# --- Group and write outputs ---
+groups = defaultdict(list)
+for f in deduped:
+    groups[f["class"]].append(f)
 
-ai_bodies = {}
-try:
-    content = _openai_chat(
-      [
-        {"role":"system","content": "You are a meticulous technical writer for AppSec reports. Output JSON only."},
-        {"role":"user","content": json.dumps({
-          "instruction":"For each class, render the REQUIRED MARKDOWN TEMPLATE fully populated. Keep exactly the headings and bullet labels.",
-          "data": payload
-        }, ensure_ascii=False)}
-      ],
-      max_tokens=3500, temperature=0.1
-    )
-    parsed = json.loads(content.strip())
-    # beklenen format: { "xss": {"body":"..."}, "sqli":{"body":"..."}, "rce":{"body":"..."}, "other":{"body":"..."} }
-    if isinstance(parsed, dict):
-        for k in ("xss","sqli","rce","other"):
-            v = parsed.get(k)
-            if isinstance(v, dict) and isinstance(v.get("body"), str) and v["body"].strip():
-                ai_bodies[k] = v
-except Exception as e:
-    ai_bodies = {}
+# Helper: make compact markdown table
+def md_table(rows, headers):
+    # rows: list of tuples
+    out = []
+    out.append("| " + " | ".join(headers) + " |")
+    out.append("| " + " | ".join("---" for _ in headers) + " |")
+    for r in rows:
+        out.append("| " + " | ".join((str(x) if x is not None else "")[:160] for x in r) + " |")
+    return "\n".join(out)
 
-json.dump(ai_bodies, open(BODIES_OUT,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-print(f"[AI] class bodies -> {BODIES_OUT}; keys={list(ai_bodies.keys())}")
+bodies = {}
+now = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.gmtime())
+for klass in ("xss","sqli","rce","other"):
+    items = groups.get(klass, [])
+    total = len(items)
+    if total == 0:
+        body = f"**{klass.upper()}**: No findings.\nGenerated: {now}"
+    else:
+        from collections import Counter
+        sev_counts = Counter(f["severity"] for f in items)
+        fp_counts  = Counter("fp" if f.get("fp_suspect") else "tp" for f in items)
+        top_rows = []
+        # Top 15 unique (pluginId,url)
+        seen_keys = set()
+        for f in items:
+            k = (f.get("pluginId"), f.get("url"))
+            if k in seen_keys: 
+                continue
+            seen_keys.add(k)
+            top_rows.append((f.get("severity"), f.get("name"), f.get("url"), f.get("source")))
+            if len(top_rows) >= 15:
+                break
+        body_lines = []
+        body_lines.append(f"**Total:** {total} | **Severity:** " +
+                          ", ".join(f"{k}:{sev_counts[k]}" for k in ("critical","high","medium","low","info","unknown") if k in sev_counts))
+        if fp_counts:
+            body_lines.append(f"**AI-suspected FP:** {fp_counts.get('fp',0)} / {total}")
+        body_lines.append("")
+        body_lines.append(md_table(top_rows, headers=["Severity","Title","URL","Source"]))
+        # Collapsible details (limited)
+        details = []
+        for f in items[:100]:
+            details.append(f"- `{f.get('severity','')}` **{f.get('name','')}** → {f.get('url','')} (src: {f.get('source','')}, id: `{f.get('id','')}`)")
+        body_lines.append("\n<details><summary>Details (first 100)</summary>\n\n" + "\n".join(details) + "\n\n</details>")
+        body_lines.append(f"\nGenerated: {now}")
+        body = "\n".join(body_lines)
+    bodies[klass] = {"body": body}
+
+# Save outputs
+os.makedirs(REPORT_DIR, exist_ok=True)
+with open(OUT_PATH, "w", encoding="utf-8") as fh:
+    json.dump(deduped, fh, ensure_ascii=False, indent=2)
+with open(BODIES_OUT, "w", encoding="utf-8") as fh:
+    json.dump(bodies, fh, ensure_ascii=False, indent=2)
+
+print(f"[AI] refined -> {OUT_PATH}; total={len(deduped)}")
+print(f"[AI] class bodies -> {BODIES_OUT}; keys={list(bodies.keys())}")
