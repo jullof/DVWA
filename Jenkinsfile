@@ -232,20 +232,25 @@ ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "TARGET_URL='${TARGET_URL}' IMAGE_NAME='
 set -eux
 mkdir -p ~/dast_wrk
 
+# ZAP image
 docker pull "$ZAP_IMAGE" || true
 
+# App container
 docker rm -f app-under-test || true
 docker run -d --name app-under-test -p 8080:80 "$IMAGE_NAME:$IMAGE_TAG"
 
+# Wait app
 for i in $(seq 1 60); do
   curl -sf "$TARGET_URL/" >/dev/null && break || sleep 2
 done
 
+# DVWA DB init (idempotent)
 curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -L "$TARGET_URL/setup.php" -o /dev/null || true
 curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -d 'create_db=Create+%2F+Reset+Database' -L "$TARGET_URL/setup.php" -o /dev/null || true
 
+# Login
 curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -L "$TARGET_URL/login.php" -o /dev/null || true
-USER_TOKEN=$(curl -sS -b ~/dast_wrk/cookie.txt "$TARGET_URL/login.php" | sed -n 's/.*name="user_token" value="\([^"]*\)".*/\1/p' | head -n1 || true)
+USER_TOKEN=$(curl -sS -b ~/dast_wrk/cookie.txt "$TARGET_URL/login.php" | awk 'match($0, /name="user_token" value="([^"]*)"/, m){print m[1]; exit}')
 if [ -n "$USER_TOKEN" ]; then
   POST_DATA="username=$DVWA_USER&password=$DVWA_PASS&Login=Login&user_token=$USER_TOKEN"
 else
@@ -256,6 +261,7 @@ curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -e "$TARGET_URL/login
 PHPSESSID=$(awk '$6=="PHPSESSID"{print $7}' ~/dast_wrk/cookie.txt | tail -n1 || true)
 echo "Using PHPSESSID=$PHPSESSID"
 
+# ZAP full scan (cookie via Replacer)
 docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "$ZAP_IMAGE" \
   zap-full-scan.py \
     -t "$TARGET_URL" \
@@ -273,6 +279,7 @@ docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "$ZAP_IMAGE" \
     " || true
 REMOTE
 
+# Pull reports back
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
 '''
@@ -295,6 +302,7 @@ scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_D
     }
   }
 }
+
 
 
 
