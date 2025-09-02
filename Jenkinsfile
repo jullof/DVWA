@@ -220,15 +220,15 @@ SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG}
   }
   steps {
     script { if (env.DAST_MODE == 'abort') { milestone(40) } }
-    sh "mkdir -p ${REPORT_DIR}"
+    sh 'mkdir -p ${REPORT_DIR}'
 
     sshagent(credentials: [env.DAST_SSH_CRED]) {
       lock(resource: 'dast-scan', inversePrecedence: true) {
-        sh """
+        sh '''
 set -e
 SSH_OPTS='-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes'
 
-ssh \$SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; export IMAGE_NAME='${IMAGE_NAME}'; export IMAGE_TAG='${IMAGE_TAG}'; export TARGET_URL='${TARGET_URL}'; export REPORT_HTML='${REPORT_HTML}'; export REPORT_JSON='${REPORT_JSON}'; export DVWA_USER='${DVWA_USER}'; export DVWA_PASS='${DVWA_PASS}'; bash -s" <<'BASH'
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; export IMAGE_NAME='${IMAGE_NAME}'; export IMAGE_TAG='${IMAGE_TAG}'; export TARGET_URL='${TARGET_URL}'; export REPORT_HTML='${REPORT_HTML}'; export REPORT_JSON='${REPORT_JSON}'; export DVWA_USER='${DVWA_USER}'; export DVWA_PASS='${DVWA_PASS}'; bash -s" <<'BASH'
 set -eu
 mkdir -p ~/dast_wrk
 
@@ -271,7 +271,7 @@ docker run -d --name "$APP" --network "$NET" -p 8080:80 \
     vulnerables/web-dvwa
 }
 
-# Health check for the app exposed on DAST VM :8080 (TARGET_URL is http://127.0.0.1:8080)
+# Health check 
 for i in $(seq 1 60); do
   curl -sf "${TARGET_URL}/" >/dev/null && { echo "App is up"; break; }
   sleep 2
@@ -282,26 +282,26 @@ CJ=~/dast_wrk/c.txt
 : > "$CJ"
 CURL="curl -sS -L -c $CJ -b $CJ"
 
-echo ">>> setup.php (create/reset DB, idempotent)"
+echo ">>> setup.php (create/reset DB)"
 $CURL -e "${TARGET_URL}/setup.php" \
   -d "create_db=Create+%2F+Reset+Database" \
   "${TARGET_URL}/setup.php" >/dev/null || true
 
-echo ">>> Login (use CSRF token if present)"
+echo ">>> Login "
 $CURL "${TARGET_URL}/login.php" -o ~/dast_wrk/login.html || true
-LTOK=$(grep -oP 'name="user_token"\s+value="\K[^"]+' ~/dast_wrk/login.html || true)
+LTOK=$(grep -oP 'name="user_token"\\s+value="\\K[^"]+' ~/dast_wrk/login.html || true)
 POST="username=${DVWA_USER}&password=${DVWA_PASS}&Login=Login"
 [ -n "$LTOK" ] && POST="$POST&user_token=$LTOK"
 $CURL -e "${TARGET_URL}/login.php" -d "$POST" "${TARGET_URL}/login.php" >/dev/null || true
 
 echo ">>> Set DVWA security=low"
 $CURL "${TARGET_URL}/security.php" -o ~/dast_wrk/sec.html || true
-STOK=$(grep -oP 'name="user_token"\s+value="\K[^"]+' ~/dast_wrk/sec.html || true)
+STOK=$(grep -oP 'name="user_token"\\s+value="\\K[^"]+' ~/dast_wrk/sec.html || true)
 SPOST="security=low&seclev_submit=Submit"
 [ -n "$STOK" ] && SPOST="$SPOST&user_token=$STOK"
 $CURL -e "${TARGET_URL}/security.php" -d "$SPOST" "${TARGET_URL}/security.php" >/dev/null || true
 
-LEVEL=$($CURL "${TARGET_URL}/security.php" | grep -oP 'Security level:\s*\K\w+' || true)
+LEVEL=$($CURL "${TARGET_URL}/security.php" | grep -oP 'Security level:\\s*\\K\\w+' || true)
 PHPSESSID=$(awk '$6=="PHPSESSID"{print $7}' "$CJ" | tail -n1 || true)
 SEC=$(awk '$6=="security"{print $7}' "$CJ" | tail -n1 || true)
 echo "Verify -> level=${LEVEL:-unknown} cookie_security=${SEC:-none}"
@@ -331,26 +331,15 @@ docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "${ZAP_IMAGE}" \
       -config ascan.maxRuleDurationInMins=25
       -config ascan.threadPerHost=8
     " || true
-
-
 BASH
 
-# Pull reports back
-scp \$SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
-scp \$SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
-"""
+scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
+scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
+'''
       }
     }
   }
-  post {
-    always {
-      publishHTML(target: [reportDir: "${REPORT_DIR}", reportFiles: "${REPORT_HTML}", reportName: "ZAP DAST Report", keepAll: true, alwaysLinkToLastBuild: true])
-      archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
-    }
-    unsuccessful { echo 'DAST scan failed or timed out.' }
-  }
 }
-
 
 
 
