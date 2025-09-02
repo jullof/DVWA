@@ -214,72 +214,71 @@ SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG}
     stage('Run DAST scan on DAST VM') {
   options { timeout(time: 24, unit: 'HOURS') }
   environment {
-    ZAP_IMAGE = "ghcr.io/zaproxy/zaproxy:stable"
-    DVWA_USER = "admin"
-    DVWA_PASS = "password"
+    ZAP_IMAGE = 'ghcr.io/zaproxy/zaproxy:stable'
   }
   steps {
-    script { if (env.DAST_MODE == 'abort') { milestone(40) } }
     sh "mkdir -p ${REPORT_DIR}"
-
     sshagent(credentials: [env.DAST_SSH_CRED]) {
       lock(resource: 'dast-scan', inversePrecedence: true) {
         sh '''#!/usr/bin/env bash
-set -eux
+set -e
 SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "TARGET_URL='${TARGET_URL}' IMAGE_NAME='${IMAGE_NAME}' IMAGE_TAG='${IMAGE_TAG}' ZAP_IMAGE='${ZAP_IMAGE}' DVWA_USER='${DVWA_USER}' DVWA_PASS='${DVWA_PASS}' REPORT_HTML='${REPORT_HTML}' REPORT_JSON='${REPORT_JSON}' bash -s" <<'REMOTE'
-set -eux
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} \
+  "TARGET_URL='${TARGET_URL}' IMAGE_NAME='${IMAGE_NAME}' IMAGE_TAG='${IMAGE_TAG}' ZAP_IMAGE='${ZAP_IMAGE}' REPORT_HTML='${REPORT_HTML}' REPORT_JSON='${REPORT_JSON}' bash -s" <<'REMOTE'
+set -e
+
 mkdir -p ~/dast_wrk
+docker pull "${ZAP_IMAGE}" || true
 
-# ZAP image
-docker pull "$ZAP_IMAGE" || true
-
-# App container
 docker rm -f app-under-test || true
-docker run -d --name app-under-test -p 8080:80 "$IMAGE_NAME:$IMAGE_TAG"
+docker run -d --name app-under-test -p 8080:80 "${IMAGE_NAME}:${IMAGE_TAG}"
 
-# Wait app
+# Healthcheck
 for i in $(seq 1 60); do
-  curl -sf "$TARGET_URL/" >/dev/null && break || sleep 2
+  curl -sf "${TARGET_URL}/" >/dev/null && break || sleep 2
 done
 
-# DVWA DB init (idempotent)
-curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -L "$TARGET_URL/setup.php" -o /dev/null || true
-curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -d 'create_db=Create+%2F+Reset+Database' -L "$TARGET_URL/setup.php" -o /dev/null || true
 
-# Login
-curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -L "$TARGET_URL/login.php" -o /dev/null || true
-USER_TOKEN=$(curl -sS -b ~/dast_wrk/cookie.txt "$TARGET_URL/login.php" | awk 'match($0, /name="user_token" value="([^"]*)"/, m){print m[1]; exit}')
+USER_TOKEN=$(curl -sS -b ~/dast_wrk/cookie.txt "${TARGET_URL}/login.php" \
+  | sed -n 's/.*name="user_token" value="\([^"]*\)".*/\1/p' | head -n1 || true)
+
 if [ -n "$USER_TOKEN" ]; then
-  POST_DATA="username=$DVWA_USER&password=$DVWA_PASS&Login=Login&user_token=$USER_TOKEN"
+  POST_DATA="username=admin&password=password&Login=Login&user_token=$USER_TOKEN"
 else
-  POST_DATA="username=$DVWA_USER&password=$DVWA_PASS&Login=Login"
+  POST_DATA="username=admin&password=password&Login=Login"
 fi
-curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -e "$TARGET_URL/login.php" -d "$POST_DATA" -L "$TARGET_URL/login.php" -o /dev/null
+
+curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt \
+     -e "${TARGET_URL}/login.php" -d "$POST_DATA" \
+     -L "${TARGET_URL}/login.php" -o /dev/null || true
 
 PHPSESSID=$(awk '$6=="PHPSESSID"{print $7}' ~/dast_wrk/cookie.txt | tail -n1 || true)
-echo "Using PHPSESSID=$PHPSESSID"
+echo "PHPSESSID=$PHPSESSID"
 
-# ZAP full scan (cookie via Replacer)
-docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "$ZAP_IMAGE" \
+ZAP_ARGS="
+  -config spider.maxDuration=10
+  -config ascan.maxRuleDurationInMins=10
+"
+if [ -n "$PHPSESSID" ]; then
+  ZAP_ARGS="$ZAP_ARGS
+    -config replacer.full_list(0).description=AddCookie
+    -config replacer.full_list(0).enabled=true
+    -config replacer.full_list(0).matchtype=REQ_HEADER
+    -config replacer.full_list(0).matchstr=Cookie
+    -config replacer.full_list(0).regex=false
+    -config replacer.full_list(0).replacement=PHPSESSID=$PHPSESSID
+  "
+fi
+
+docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "${ZAP_IMAGE}" \
   zap-full-scan.py \
-    -t "$TARGET_URL" \
-    -r "/zap/wrk/$REPORT_HTML" \
-    -J "/zap/wrk/$REPORT_JSON" \
-    -z "
-      -config replacer.full_list(0).description=AddCookie
-      -config replacer.full_list(0).enabled=true
-      -config replacer.full_list(0).matchtype=REQ_HEADER
-      -config replacer.full_list(0).matchstr=Cookie
-      -config replacer.full_list(0).regex=false
-      -config replacer.full_list(0).replacement=PHPSESSID=$PHPSESSID
-      -config spider.maxDuration=10
-      -config ascan.maxRuleDurationInMins=10
-    " || true
+    -t "${TARGET_URL}" \
+    -r "/zap/wrk/${REPORT_HTML}" \
+    -J "/zap/wrk/${REPORT_JSON}" \
+    -z "$ZAP_ARGS" || true
 REMOTE
 
-# Pull reports back
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
 '''
@@ -302,6 +301,7 @@ scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_D
     }
   }
 }
+
 
 
 
