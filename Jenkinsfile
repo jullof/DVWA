@@ -228,78 +228,71 @@ SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG}
 set -e
 SSH_OPTS='-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes'
 
-ssh \$SSH_OPTS ${DAST_USER}@${DAST_HOST} \\
-  "export ZAP_IMAGE='${ZAP_IMAGE}'; \\
-   export IMAGE_NAME='${IMAGE_NAME}'; \\
-   export IMAGE_TAG='${IMAGE_TAG}'; \\
-   export TARGET_URL='${TARGET_URL}'; \\
-   export REPORT_HTML='${REPORT_HTML}'; \\
-   export REPORT_JSON='${REPORT_JSON}'; \\
-   export DVWA_USER='${DVWA_USER}'; \\
-   export DVWA_PASS='${DVWA_PASS}'; \\
-   bash -s" <<'BASH'
+ssh \$SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; export IMAGE_NAME='${IMAGE_NAME}'; export IMAGE_TAG='${IMAGE_TAG}'; export TARGET_URL='${TARGET_URL}'; export REPORT_HTML='${REPORT_HTML}'; export REPORT_JSON='${REPORT_JSON}'; export DVWA_USER='${DVWA_USER}'; export DVWA_PASS='${DVWA_PASS}'; bash -s" <<'BASH'
 set -eu
 mkdir -p ~/dast_wrk
 
-echo ">>> ZAP_IMAGE=\${ZAP_IMAGE:-}"
-echo ">>> IMAGE=\${IMAGE_NAME:-}:\${IMAGE_TAG:-}"
-echo ">>> TARGET_URL=\${TARGET_URL:-}"
-
-[ -n "\${IMAGE_NAME:-}" ] || { echo "IMAGE_NAME missing"; exit 2; }
-[ -n "\${IMAGE_TAG:-}" ]  || { echo "IMAGE_TAG missing"; exit 2; }
-[ -n "\${TARGET_URL:-}" ] || { echo "TARGET_URL missing"; exit 2; }
-
-if [ -n "\${ZAP_IMAGE:-}" ]; then
-  docker pull "\${ZAP_IMAGE}" || true
-fi
-
+echo ">>> Bring app-under-test up"
 docker rm -f app-under-test >/dev/null 2>&1 || true
 docker run -d --name app-under-test -p 8080:80 "\${IMAGE_NAME}:\${IMAGE_TAG}"
 
-# Health check (maks 120s)
-ok=0
+# Health check
 for i in \$(seq 1 60); do
   if curl -sf "\${TARGET_URL}/" >/dev/null; then
     echo "App is up"
-    ok=1
     break
   fi
   sleep 2
 done
-if [ "\$ok" -ne 1 ]; then
-  echo "App did not become ready at \${TARGET_URL}"
-  # exit 3
-fi
 
-curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -L "\${TARGET_URL}/login.php" -o /dev/null || true
-curl -sS -c ~/dast_wrk/cookie.txt -b ~/dast_wrk/cookie.txt -e "\${TARGET_URL}/login.php" \\
-  -d "username=\${DVWA_USER:-admin}&password=\${DVWA_PASS:-password}&Login=Login" \\
-  -L "\${TARGET_URL}/login.php" -o /dev/null || true
+echo ">>> Login (parse user_token if present)"
+curl -sS -c ~/dast_wrk/c.txt -b ~/dast_wrk/c.txt -L "\${TARGET_URL}/login.php" -o ~/dast_wrk/login.html || true
+LTOK=\$(grep -oP 'name="user_token"\\s+value="\\K[^"]+' ~/dast_wrk/login.html || true)
+POST="username=\${DVWA_USER}&password=\${DVWA_PASS}&Login=Login"
+[ -n "\$LTOK" ] && POST="\$POST&user_token=\$LTOK"
+curl -sS -c ~/dast_wrk/c.txt -b ~/dast_wrk/c.txt -e "\${TARGET_URL}/login.php" -d "\$POST" -L "\${TARGET_URL}/login.php" -o /dev/null || true
 
-PHPSESSID=\$(awk '\$6=="PHPSESSID"{print \$7}' ~/dast_wrk/cookie.txt | tail -n1 || true)
-echo "PHPSESSID=\${PHPSESSID:-<empty>}"
+PHPSESSID=\$(awk '\$6=="PHPSESSID"{print \$7}' ~/dast_wrk/c.txt | tail -n1 || true)
 
-if [ -n "\${ZAP_IMAGE:-}" ]; then
-  docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "\${ZAP_IMAGE}" \\
-    zap-full-scan.py \\
-      -t "\${TARGET_URL}" \\
-      -r "/zap/wrk/\${REPORT_HTML}" \\
-      -J "/zap/wrk/\${REPORT_JSON}" \\
-      -z "
-        -config replacer.full_list(0).description=AddCookie
-        -config replacer.full_list(0).enabled=true
-        -config replacer.full_list(0).matchtype=REQ_HEADER
-        -config replacer.full_list(0).matchstr=Cookie
-        -config replacer.full_list(0).regex=false
-        -config replacer.full_list(0).replacement=PHPSESSID=\${PHPSESSID}
-        -config spider.maxDuration=30
-        -config ascan.maxRuleDurationInMins=15
-      " || true
-else
-  echo "ZAP_IMAGE empty; skipping ZAP run"
-fi
+echo ">>> Set DVWA security=low"
+curl -sS -c ~/dast_wrk/c.txt -b ~/dast_wrk/c.txt -L "\${TARGET_URL}/security.php" -o ~/dast_wrk/sec.html || true
+STOK=\$(grep -oP 'name="user_token"\\s+value="\\K[^"]+' ~/dast_wrk/sec.html || true)
+SPOST="security=low&seclev_submit=Submit"
+[ -n "\$STOK" ] && SPOST="\$SPOST&user_token=\$STOK"
+curl -sS -c ~/dast_wrk/c.txt -b ~/dast_wrk/c.txt -e "\${TARGET_URL}/security.php" -d "\$SPOST" -L "\${TARGET_URL}/security.php" -o /dev/null || true
+
+SEC=\$(awk '\$6=="security"{print \$7}' ~/dast_wrk/c.txt | tail -n1 || true)
+echo "Cookies -> PHPSESSID=\$PHPSESSID security=\$SEC"
+
+echo ">>> Pull ZAP (optional)"
+docker pull "\${ZAP_IMAGE}" || true
+
+echo ">>> ZAP deep scan (Ajax Spider + Spider + Active Scan)"
+docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "\${ZAP_IMAGE}" \\
+  zap-full-scan.py -j \\
+    -t "\${TARGET_URL}" \\
+    -x ".*logout.*" \\
+    -r "/zap/wrk/\${REPORT_HTML}" \\
+    -J "/zap/wrk/\${REPORT_JSON}" \\
+    -z "
+      -config replacer.full_list(0).description=AddCookie
+      -config replacer.full_list(0).enabled=true
+      -config replacer.full_list(0).matchtype=REQ_HEADER
+      -config replacer.full_list(0).matchstr=Cookie
+      -config replacer.full_list(0).regex=false
+      -config replacer.full_list(0).replacement=PHPSESSID=\${PHPSESSID}; security=low
+      -config spider.maxDepth=15
+      -config spider.maxDuration=45
+      -config spider.parseComments=true
+      -config spider.parseRobotsTxt=true
+      -config spider.postForm=true
+      -config ascan.maxRuleDurationInMins=25
+      -config ascan.threadPerHost=8
+    " || true
+
 BASH
 
+# Pull reports back
 scp \$SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
 scp \$SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
 """
@@ -308,20 +301,13 @@ scp \$SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_
   }
   post {
     always {
-      publishHTML(target: [
-        reportDir: "${REPORT_DIR}",
-        reportFiles: "${REPORT_HTML}",
-        reportName: "ZAP DAST Report",
-        keepAll: true,
-        alwaysLinkToLastBuild: true
-      ])
+      publishHTML(target: [reportDir: "${REPORT_DIR}", reportFiles: "${REPORT_HTML}", reportName: "ZAP DAST Report", keepAll: true, alwaysLinkToLastBuild: true])
       archiveArtifacts artifacts: "${REPORT_DIR}/*", fingerprint: true, allowEmptyArchive: false
     }
-    unsuccessful {
-      echo 'DAST scan failed or timed out.'
-    }
+    unsuccessful { echo 'DAST scan failed or timed out.' }
   }
 }
+
 
 
 
