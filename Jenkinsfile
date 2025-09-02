@@ -232,55 +232,97 @@ ssh \$SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; expor
 set -eu
 mkdir -p ~/dast_wrk
 
-echo ">>> Bring app-under-test up"
-docker rm -f app-under-test >/dev/null 2>&1 || true
-docker run -d --name app-under-test -p 8080:80 "\${IMAGE_NAME}:\${IMAGE_TAG}"
+NET="dvwa-net"
+DB="dvwa-db"
+APP="app-under-test"
 
-# Health check
-for i in \$(seq 1 60); do
-  if curl -sf "\${TARGET_URL}/" >/dev/null; then
-    echo "App is up"
-    break
-  fi
+echo ">>> Ensure network"
+docker network create "$NET" >/dev/null 2>&1 || true
+
+echo ">>> Clean old"
+docker rm -f "$APP" "$DB" >/dev/null 2>&1 || true
+
+echo ">>> Start DB (MariaDB)"
+docker run -d --name "$DB" --network "$NET" \
+  -e MYSQL_ROOT_PASSWORD='p@ssw0rd' \
+  -e MYSQL_DATABASE='dvwa' \
+  -e MYSQL_USER='dvwa' \
+  -e MYSQL_PASSWORD='p@ssw0rd' \
+  mariadb:10.6 --default-authentication-plugin=mysql_native_password
+
+echo ">>> Wait DB ready"
+until docker exec "$DB" mysql -udvwa -p'p@ssw0rd' -e "SELECT 1" dvwa >/dev/null 2>&1; do
   sleep 2
 done
 
-echo ">>> Login (parse user_token if present)"
-curl -sS -c ~/dast_wrk/c.txt -b ~/dast_wrk/c.txt -L "\${TARGET_URL}/login.php" -o ~/dast_wrk/login.html || true
-LTOK=\$(grep -oP 'name="user_token"\\s+value="\\K[^"]+' ~/dast_wrk/login.html || true)
-POST="username=\${DVWA_USER}&password=\${DVWA_PASS}&Login=Login"
-[ -n "\$LTOK" ] && POST="\$POST&user_token=\$LTOK"
-curl -sS -c ~/dast_wrk/c.txt -b ~/dast_wrk/c.txt -e "\${TARGET_URL}/login.php" -d "\$POST" -L "\${TARGET_URL}/login.php" -o /dev/null || true
+echo ">>> Bring app-under-test up (wired to DB)"
+docker run -d --name "$APP" --network "$NET" -p 8080:80 \
+  -e DB_SERVER="$DB" \
+  -e MYSQL_DATABASE='dvwa' \
+  -e MYSQL_USER='dvwa' \
+  -e MYSQL_PASSWORD='p@ssw0rd' \
+  "${IMAGE_NAME}:${IMAGE_TAG}" || {
+  echo "WARN: fallback to public DVWA image"
+  docker run -d --name "$APP" --network "$NET" -p 8080:80 \
+    -e DB_SERVER="$DB" \
+    -e MYSQL_DATABASE='dvwa' \
+    -e MYSQL_USER='dvwa' \
+    -e MYSQL_PASSWORD='p@ssw0rd' \
+    vulnerables/web-dvwa
+}
 
-PHPSESSID=\$(awk '\$6=="PHPSESSID"{print \$7}' ~/dast_wrk/c.txt | tail -n1 || true)
+# Health check for the app exposed on DAST VM :8080 (TARGET_URL is http://127.0.0.1:8080)
+for i in $(seq 1 60); do
+  curl -sf "${TARGET_URL}/" >/dev/null && { echo "App is up"; break; }
+  sleep 2
+done
+
+# ---- DVWA init + force low ----
+CJ=~/dast_wrk/c.txt
+: > "$CJ"
+CURL="curl -sS -L -c $CJ -b $CJ"
+
+echo ">>> setup.php (create/reset DB, idempotent)"
+$CURL -e "${TARGET_URL}/setup.php" \
+  -d "create_db=Create+%2F+Reset+Database" \
+  "${TARGET_URL}/setup.php" >/dev/null || true
+
+echo ">>> Login (use CSRF token if present)"
+$CURL "${TARGET_URL}/login.php" -o ~/dast_wrk/login.html || true
+LTOK=$(grep -oP 'name="user_token"\s+value="\K[^"]+' ~/dast_wrk/login.html || true)
+POST="username=${DVWA_USER}&password=${DVWA_PASS}&Login=Login"
+[ -n "$LTOK" ] && POST="$POST&user_token=$LTOK"
+$CURL -e "${TARGET_URL}/login.php" -d "$POST" "${TARGET_URL}/login.php" >/dev/null || true
 
 echo ">>> Set DVWA security=low"
-curl -sS -c ~/dast_wrk/c.txt -b ~/dast_wrk/c.txt -L "\${TARGET_URL}/security.php" -o ~/dast_wrk/sec.html || true
-STOK=\$(grep -oP 'name="user_token"\\s+value="\\K[^"]+' ~/dast_wrk/sec.html || true)
+$CURL "${TARGET_URL}/security.php" -o ~/dast_wrk/sec.html || true
+STOK=$(grep -oP 'name="user_token"\s+value="\K[^"]+' ~/dast_wrk/sec.html || true)
 SPOST="security=low&seclev_submit=Submit"
-[ -n "\$STOK" ] && SPOST="\$SPOST&user_token=\$STOK"
-curl -sS -c ~/dast_wrk/c.txt -b ~/dast_wrk/c.txt -e "\${TARGET_URL}/security.php" -d "\$SPOST" -L "\${TARGET_URL}/security.php" -o /dev/null || true
+[ -n "$STOK" ] && SPOST="$SPOST&user_token=$STOK"
+$CURL -e "${TARGET_URL}/security.php" -d "$SPOST" "${TARGET_URL}/security.php" >/dev/null || true
 
-SEC=\$(awk '\$6=="security"{print \$7}' ~/dast_wrk/c.txt | tail -n1 || true)
-echo "Cookies -> PHPSESSID=\$PHPSESSID security=\$SEC"
+LEVEL=$($CURL "${TARGET_URL}/security.php" | grep -oP 'Security level:\s*\K\w+' || true)
+PHPSESSID=$(awk '$6=="PHPSESSID"{print $7}' "$CJ" | tail -n1 || true)
+SEC=$(awk '$6=="security"{print $7}' "$CJ" | tail -n1 || true)
+echo "Verify -> level=${LEVEL:-unknown} cookie_security=${SEC:-none}"
 
 echo ">>> Pull ZAP (optional)"
-docker pull "\${ZAP_IMAGE}" || true
+docker pull "${ZAP_IMAGE}" || true
 
-echo ">>> ZAP deep scan (Ajax Spider + Spider + Active Scan)"
-docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "\${ZAP_IMAGE}" \\
-  zap-full-scan.py -j \\
-    -t "\${TARGET_URL}" \\
-    -x ".*logout.*" \\
-    -r "/zap/wrk/\${REPORT_HTML}" \\
-    -J "/zap/wrk/\${REPORT_JSON}" \\
+echo ">>> ZAP deep scan (Ajax+Spider+Active) with cookie replacer"
+docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "${ZAP_IMAGE}" \
+  zap-full-scan.py -j \
+    -t "${TARGET_URL}" \
+    -x ".*logout.*" \
+    -r "/zap/wrk/${REPORT_HTML}" \
+    -J "/zap/wrk/${REPORT_JSON}" \
     -z "
       -config replacer.full_list(0).description=AddCookie
       -config replacer.full_list(0).enabled=true
       -config replacer.full_list(0).matchtype=REQ_HEADER
       -config replacer.full_list(0).matchstr=Cookie
       -config replacer.full_list(0).regex=false
-      -config replacer.full_list(0).replacement=PHPSESSID=\${PHPSESSID}; security=low
+      -config replacer.full_list(0).replacement=PHPSESSID=${PHPSESSID}; security=low
       -config spider.maxDepth=15
       -config spider.maxDuration=45
       -config spider.parseComments=true
@@ -289,6 +331,7 @@ docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "\${ZAP_IMAGE}" \\
       -config ascan.maxRuleDurationInMins=25
       -config ascan.threadPerHost=8
     " || true
+
 
 BASH
 
