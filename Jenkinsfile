@@ -51,7 +51,7 @@ environment {
   AUTH_FORM_METHOD     = 'POST'                                          
   AUTH_FORM_BODY       = 'username=admin&password=password&Login=Login&user_token={{CSRF}}' 
   AUTH_FORM_HEADERS    = ''                                              
-  AUTH_CSRF_REGEX      = 'name=["'']user_token["'']\\s+value=["'']([^"'']+)' 
+  AUTH_CSRF_REGEX = "name=[\"']user_token[\"']\\s+value=[\"']\\K[^\"']+"
   AUTH_CSRF_BODY_PLACEHOLDER = '{{CSRF}}'                                
 
   AUTH_BASIC_USER   = ''   
@@ -343,15 +343,22 @@ case "${AUTH_TYPE:-none}" in
                      -config replacer.full_list(0).replacement=${COOKIE_SRC}"
     fi
     ;;
-  form)
+    form)
     CJ=~/dast_wrk/cookies.txt
     : > "$CJ"
     BODY="${AUTH_FORM_BODY:-}"
+
     if [ -n "${AUTH_CSRF_REGEX:-}" ]; then
       PAGE="$(curl -skL "${AUTH_FORM_URL}")" || true
       TOK="$(printf '%s' "$PAGE" | grep -oP "${AUTH_CSRF_REGEX}" | head -n1 || true)"
-      [ -n "$TOK" ] && BODY="${BODY//${AUTH_CSRF_BODY_PLACEHOLDER:-\{\{CSRF\}\}}/$TOK}"
+      if [ -n "$TOK" ]; then
+        PH="${AUTH_CSRF_BODY_PLACEHOLDER}"
+        [ -z "$PH" ] && PH='{{CSRF}}'
+        BODY="${BODY//${PH}/${TOK}}"
+      fi
     fi
+
+    # İsteğe bağlı ek header'lar
     HARGS=()
     if [ -n "${AUTH_FORM_HEADERS:-}" ]; then
       IFS=';' read -r -a HDRS <<< "${AUTH_FORM_HEADERS}"
@@ -360,6 +367,7 @@ case "${AUTH_TYPE:-none}" in
         [ -n "$htrim" ] && HARGS+=(-H "$htrim")
       done
     fi
+
     curl -skL -c "$CJ" -b "$CJ" "${HARGS[@]}" \
       -X "${AUTH_FORM_METHOD:-POST}" \
       --data "$BODY" \
@@ -375,9 +383,7 @@ case "${AUTH_TYPE:-none}" in
                      -config replacer.full_list(0).replacement=${COOKIES}"
     fi
     ;;
-  none|*)
-    :
-    ;;
+
 esac
 
 echo ">>> Pull ZAP image"
