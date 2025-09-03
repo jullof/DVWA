@@ -65,7 +65,7 @@ environment {
 
   // ==========================================================================
   //                   Health check 
-  // ==========================================================================
+  // ======================================================== ==================
   HEALTH_CHECK_PATH = '/'    
 
   DAST_MODE = 'abort'        
@@ -248,11 +248,24 @@ SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG}
 set -e
 SSH_OPTS='-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes'
 
+# ---- ship dvwa_up.sh to DAST VM (if exists) ----
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} 'mkdir -p ~/dast_wrk'
+if [ -f scripts/dvwa_up.sh ]; then
+  scp $SSH_OPTS scripts/dvwa_up.sh ${DAST_USER}@${DAST_HOST}:~/dast_wrk/dvwa_up.sh
+  ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} 'chmod +x ~/dast_wrk/dvwa_up.sh'
+  APP_START_CMD_REMOTE="IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} bash ~/dast_wrk/dvwa_up.sh"
+else
+  # fall back to what you set in env (may be empty or another command)
+  APP_START_CMD_REMOTE="${APP_START_CMD}"
+fi
+
+
 ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; \
   export IMAGE_NAME='${IMAGE_NAME}'; export IMAGE_TAG='${IMAGE_TAG}'; \
   export TARGET_URL='${TARGET_URL}'; export REPORT_HTML='${REPORT_HTML}'; export REPORT_JSON='${REPORT_JSON}'; \
   export APP_CONTEXT='${APP_CONTEXT}'; export APP_INTERNAL_PORT='${APP_INTERNAL_PORT}'; export APP_EXTERNAL_PORT='${APP_EXTERNAL_PORT}'; \
-  export APP_HEALTH_PATH='${APP_HEALTH_PATH}'; export APP_HEALTH_CODE='${APP_HEALTH_CODE}'; export APP_START_CMD='${APP_START_CMD}'; \
+  export APP_HEALTH_PATH='${APP_HEALTH_PATH}'; export APP_HEALTH_CODE='${APP_HEALTH_CODE}'; \
+  export APP_START_CMD=\"${APP_START_CMD_REMOTE}\"; \
   export AUTH_TYPE='${AUTH_TYPE}'; export AUTH_BASIC_USER='${AUTH_BASIC_USER}'; export AUTH_BASIC_PASS='${AUTH_BASIC_PASS}'; \
   export AUTH_BEARER_TOKEN='${AUTH_BEARER_TOKEN}'; export AUTH_COOKIE='${AUTH_COOKIE}'; export AUTH_COOKIE_CMD='${AUTH_COOKIE_CMD}'; \
   export AUTH_FORM_URL='${AUTH_FORM_URL}'; export AUTH_FORM_METHOD='${AUTH_FORM_METHOD}'; export AUTH_FORM_BODY='${AUTH_FORM_BODY}'; \
@@ -260,6 +273,7 @@ ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; \
   export AUTH_CSRF_BODY_PLACEHOLDER='${AUTH_CSRF_BODY_PLACEHOLDER}'; \
   export ZAP_EXCLUDE_REGEX='${ZAP_EXCLUDE_REGEX}'; export ZAP_EXTRA='${ZAP_EXTRA}'; \
   bash -s" <<'BASH'
+
 set -eu
 mkdir -p ~/dast_wrk
 
