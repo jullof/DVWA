@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ai_triage.py (NO-OP V)
+# ai_triage.py (OPTIMIZED VERSION)
 import os, sys, json, re, time, hashlib, urllib.request, urllib.error
 from collections import defaultdict, Counter
 
@@ -9,7 +9,7 @@ OUT_PATH   = os.path.join(REPORT_DIR, "ai_findings.json")
 BODIES_OUT = os.path.join(REPORT_DIR, "ai_bodies.json")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY","").strip()
-OPENAI_MODEL   = os.environ.get("OPENAI_MODEL","gpt-5")
+OPENAI_MODEL   = os.environ.get("OPENAI_MODEL","gpt-4o")
 OPENAI_BASE    = os.environ.get("OPENAI_BASE","https://api.openai.com/v1/chat/completions")
 
 if not OPENAI_API_KEY:
@@ -88,99 +88,141 @@ for f in norm:
     if f["id"] in seen: continue
     seen.add(f["id"]); dedup.append(f)
 
-# ---------- AI enrichment (required because key exists) ----------
+# ---------- AI enrichment ----------
 def call_openai(batch):
-    payload_items = [{
-        "id": x["id"], "title": x["title"], "severity": x["severity"],
-        "url": x["url"], "param": x.get("param"), "class": x["class"],
-        "source": x["source"], "scanner": x["scanner"],
-        "rule_or_plugin": x.get("pluginId") or x.get("cwe") or "",
-        "evidence": (x.get("evidence") or "")[:800]
-    } for x in batch]
+    # Prepare simplified input for AI
+    payload_items = []
+    for x in batch:
+        # Create a concise description for the AI
+        description = f"{x['title']}. Severity: {x['severity']}. Target: {x['url'] or 'N/A'}. Evidence: {x.get('evidence', '')[:200]}"
+        payload_items.append({
+            "id": x["id"],
+            "description": description
+        })
 
-    sys_prompt = (
-        "You are an application security triage assistant. "
-        "Given a list of web security findings (ZAP/Snyk/Semgrep), "
-        "produce a STRICT JSON with key 'items' (array). "
-        "For EACH input item, return an object containing:\n"
-        "- id (same as input)\n"
-        "- ai_priority: one of P0,P1,P2,P3,P4 (P0 highest)\n"
-        "- ai_suspected_fp: boolean (true only if VERY LIKELY a false positive)\n"
-        "- why_opened: concise 2-4 sentence rationale referencing impact & exploitability\n"
-        "- remediation: 3-6 actionable steps (numbered)\n"
-        "- references: array of 2-5 short reputable refs (OWASP/MDN/NIST/CWE/CVE)\n"
-        "- provenance: {source, scanner, rule_or_plugin, urls[], params[], evidence[]}\n"
-        "Be conservative in fp flagging; if unsure set false. Return ONLY JSON."
-    )
+    sys_prompt = """You are a security expert analyzing vulnerability findings. For each finding provided, return a JSON object with the following structure for each finding ID:
 
-    user_payload = json.dumps({"items": payload_items}, ensure_ascii=False)
+{
+  "ai_priority": "P0/P1/P2/P3/P4",
+  "ai_suspected_fp": true/false,
+  "why_opened": "2-4 sentence explanation of impact and exploitability",
+  "remediation": "3-6 actionable remediation steps as a single string with numbered steps",
+  "references": ["URL1", "URL2", "URL3"] (2-5 reputable security references)
+}
+
+PRIORITY GUIDE:
+- P0: Critical severity, actively exploited, immediate action required
+- P1: High severity, easily exploitable, important to fix
+- P2: Medium severity, requires specific conditions to exploit
+- P3: Low severity, limited impact or difficult to exploit
+- P4: Informational findings with no direct security impact
+
+FALSE POSITIVE GUIDANCE: Only mark as true if you're highly confident it's a false positive.
+
+Return ONLY valid JSON with finding IDs as keys."""
+
+    user_payload = json.dumps({"findings": payload_items}, ensure_ascii=False, indent=2)
+    
     req_body = json.dumps({
         "model": OPENAI_MODEL,
         "messages": [
-            {"role":"system","content":sys_prompt},
-            {"role":"user","content":user_payload}
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_payload}
         ],
-        "temperature": 0.0,
-        "response_format": {"type":"json_object"},
-        "max_tokens": 1200
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "max_tokens": 4000
     }).encode("utf-8")
 
     req = urllib.request.Request(
         OPENAI_BASE, data=req_body, method="POST",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
-                 "Content-Type":"application/json"}
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
     )
+    
     try:
-        with urllib.request.urlopen(req, timeout=90) as r:
+        with urllib.request.urlopen(req, timeout=120) as r:
             data = json.loads(r.read().decode("utf-8"))
         content = data["choices"][0]["message"]["content"]
-        obj = json.loads(content) if content.strip().startswith("{") else {}
-        items = obj.get("items") or []
-        # normalize to dict by id
-        m = {}
-        if isinstance(items, list):
-            for it in items:
-                if isinstance(it, dict) and "id" in it:
-                    m[it["id"]] = it
-        elif isinstance(items, dict):
-            for k,v in items.items():
-                if isinstance(v, dict):
-                    v["id"] = v.get("id", k)
-                    m[v["id"]] = v
-        return m
-    except Exception:
+        
+        # Parse AI response
+        ai_response = json.loads(content.strip())
+        return ai_response
+        
+    except urllib.error.HTTPError as e:
+        print(f"HTTP Error: {e.code} - {e.reason}")
+        print(f"Response: {e.read().decode()}")
+        return {}
+    except json.JSONDecodeError as e:
+        print(f"JSON Parse Error: {e}")
+        print(f"Raw response: {content}")
+        return {}
+    except Exception as e:
+        print(f"Unexpected error: {e}")
         return {}
 
-ai_map = {}
-B = 40
-for i in range(0, len(dedup), B):
-    ai_map.update(call_openai(dedup[i:i+B]))
-    time.sleep(0.4)
+# Process findings in smaller batches for better reliability
+ai_results = {}
+BATCH_SIZE = 10
+
+for i in range(0, len(dedup), BATCH_SIZE):
+    batch = dedup[i:i+BATCH_SIZE]
+    print(f"Processing batch {i//BATCH_SIZE + 1}/{(len(dedup)-1)//BATCH_SIZE + 1}")
+    
+    batch_results = call_openai(batch)
+    ai_results.update(batch_results)
+    
+    # Be gentle with the API
+    time.sleep(1.5)
 
 # ---------- merge & write ----------
 enriched = []
 for f in dedup:
-    extra = ai_map.get(f["id"], {})
-    prov = extra.get("provenance") or {
-        "source": f["source"], "scanner": f["scanner"],
+    finding_id = f["id"]
+    ai_data = ai_results.get(finding_id, {})
+    
+    # Ensure we have proper fallback values for all required fields
+    remediation = ai_data.get("remediation", "Review the finding manually for appropriate remediation steps.")
+    references = ai_data.get("references", [])
+    
+    # If remediation is empty, provide a default
+    if not remediation.strip():
+        remediation = "1. Review the vulnerability\n2. Implement appropriate security controls\n3. Test the fix\n4. Deploy the solution"
+    
+    # Ensure we have at least some references
+    if not references:
+        references = [
+            "https://owasp.org/www-project-top-ten/",
+            "https://cwe.mitre.org/",
+            "https://cheatsheetseries.owasp.org/"
+        ]
+    
+    # Create provenance information from original finding
+    prov = {
+        "source": f["source"],
+        "scanner": f["scanner"],
         "rule_or_plugin": f.get("pluginId") or f.get("cwe") or "",
         "urls": [u for u in {f.get("url")} if u],
         "params": [p for p in {f.get("param")} if p],
         "evidence": [e for e in {f.get("evidence")} if e]
     }
+    
     enriched.append({
         **f,
-        "ai_priority": extra.get("ai_priority","P3"),
-        "ai_suspected_fp": bool(extra.get("ai_suspected_fp", False)),
-        "why_opened": extra.get("why_opened",""),
-        "remediation": extra.get("remediation",""),
-        "references": extra.get("references") or [],
+        "ai_priority": ai_data.get("ai_priority", "P3"),
+        "ai_suspected_fp": bool(ai_data.get("ai_suspected_fp", False)),
+        "why_opened": ai_data.get("why_opened", "Needs manual review for accurate assessment."),
+        "remediation": remediation,
+        "references": references,
         "provenance": prov
     })
 
-# grouped bodies
+# Create grouped bodies for issue creation
 groups = defaultdict(list)
-for f in enriched: groups[f["class"]].append(f)
+for f in enriched: 
+    groups[f["class"]].append(f)
 
 def table(rows, headers):
     out = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
@@ -195,7 +237,8 @@ for klass in ("xss","sqli","rce","other"):
     if not items:
         bodies[klass] = {"body": f"**{klass.upper()}**: No findings.\nGenerated: {now}"}
         continue
-    # top rows
+        
+    # Create summary table
     uniq, rows = set(), []
     for x in items:
         key = (x.get("pluginId"), x.get("url"))
@@ -203,12 +246,14 @@ for klass in ("xss","sqli","rce","other"):
         uniq.add(key)
         rows.append((x["severity"], x["title"], x.get("url",""), x.get("ai_priority","P3")))
         if len(rows) >= 15: break
-    # details
+            
+    # Create detailed findings section
     details = []
     for x in items[:80]:
         prov = x.get("provenance") or {}
         urls = ", ".join(prov.get("urls") or ([x.get("url")] if x.get("url") else []))
         refs = "".join(f"\n  - {r}" for r in (x.get("references") or [])[:6])
+        
         details.append(
 f"""- **{x.get('title','')}** (`{x.get('severity','')}`, {x.get('ai_priority','P3')})
   - **Why:** {x.get('why_opened','')}
@@ -219,12 +264,16 @@ f"""- **{x.get('title','')}** (`{x.get('severity','')}`, {x.get('ai_priority','P
   - **References:**{refs}
 """.rstrip()
         )
+    
     body = f"{table(rows, ['Severity','Title','URL','Priority'])}\n\n<details><summary>Details (first 80)</summary>\n\n" + "\n\n".join(details) + f"\n\n</details>\n\nGenerated: {now}"
     bodies[klass] = {"body": body}
 
+# Write outputs
 os.makedirs(REPORT_DIR, exist_ok=True)
-with open(OUT_PATH,"w",encoding="utf-8") as fh: json.dump(enriched, fh, ensure_ascii=False, indent=2)
-with open(BODIES_OUT,"w",encoding="utf-8") as fh: json.dump(bodies, fh, ensure_ascii=False, indent=2)
+with open(OUT_PATH,"w",encoding="utf-8") as fh: 
+    json.dump(enriched, fh, ensure_ascii=False, indent=2)
+with open(BODIES_OUT,"w",encoding="utf-8") as fh: 
+    json.dump(bodies, fh, ensure_ascii=False, indent=2)
 
 print(f"[AI] refined -> {OUT_PATH}; total={len(enriched)}")
 print(f"[AI] class bodies -> {BODIES_OUT}; keys={list(bodies.keys())}")

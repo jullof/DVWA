@@ -8,53 +8,68 @@ pipeline {
     timeout(time: 30, unit: 'HOURS')
   }
 
-  environment {
-    // App VM
-    APP_HOST   = '192.168.191.132'
-    APP_USER   = 'app'
-    DEPLOY_DIR = '/opt/app'
 
-    // DAST VM
-    DAST_HOST     = '192.168.191.133'
-    DAST_USER     = 'dast'
-    DAST_SSH_CRED = 'dast_ssh_cred_id'
 
-    // Image
-    IMAGE_NAME = 'app-local'
-    IMAGE_TAG  = "${env.BUILD_NUMBER}"
+environment {
+  APP_HOST   = '192.168.191.132'     
+  APP_USER   = 'app'                
+  APP_SSH_CRED = 'app' 
+  DEPLOY_DIR = '/opt/app'          
 
-    // Reports
-    REPORT_DIR  = 'reports'
-    REPORT_HTML = 'zap_report.html'
-    REPORT_JSON = 'zap_report.json'
+  DAST_HOST     = '192.168.191.133' 
+  DAST_USER     = 'dast'             
+  DAST_SSH_CRED = 'dast_ssh_cred_id'
 
-    // GitHub Issues
-    GITHUB_TOKEN_CRED = 'github_token_cred_id'
-    GITHUB_REPO       = 'jullof/DVWA'  // Update with your actual repo name
+  IMAGE_NAME = 'app-local'          
+  IMAGE_TAG  = "${env.BUILD_NUMBER}" 
+  REPORT_DIR  = 'reports'            
+  REPORT_HTML = 'zap_report.html'    
+  REPORT_JSON = 'zap_report.json'    
+  GITHUB_TOKEN_CRED = 'github_token_cred_id' 
+  GITHUB_REPO       = 'jullof/DVWA'         
 
-    // AI Configuration
-    USE_AI       = 'true'
-    SHOW_RECOM   = 'true'
-    AI_THRESHOLD = '0.6'
-    OPENAI_MODEL = 'gpt-5'
-    OPENAI_BASE  = 'https://api.openai.com/v1/chat/completions'
+  // ------------ AI  ------------
+  USE_AI       = 'true'               
+  SHOW_RECOM   = 'true'              
+  AI_THRESHOLD = '0.6'             
+  OPENAI_MODEL = 'gpt-5'              
+  OPENAI_BASE  = 'https://api.openai.com/v1/chat/completions' // API base
 
-    // DAST Configuration
-    TARGET_URL     = 'http://127.0.0.1:8080'
-    FAIL_ON_RISK   = 'none'
-    APP_CONTEXT    = ''  // Application context path (e.g., '/api', '/app')
-    
-    // Authentication (if needed)
-    APP_LOGIN_URL     = ''  // Login endpoint if authentication required
-    APP_USERNAME      = ''  // Application username
-    APP_PASSWORD      = ''  // Application password
-    
-    // Health check endpoint
-    HEALTH_CHECK_PATH = '/'  // Health check path
+  // ==========================================================================
+  // ==========================================================================
+  TARGET_URL        = 'http://127.0.0.1:8080' 
+  APP_CONTEXT       = ''                     
+  APP_INTERNAL_PORT = '80'                  
+  APP_EXTERNAL_PORT = '8080'                 
+  APP_HEALTH_PATH   = '/login.php'           
+  APP_HEALTH_CODE   = '200'                   
+  ZAP_EXCLUDE_REGEX = '.*logout.*|.*setup.*' 
+  ZAP_EXTRA         = ''                      
 
-    // Policy mode (abort | freeze)
-    DAST_MODE = 'abort'
-  }
+  AUTH_TYPE            = 'form'                                        
+  AUTH_FORM_URL        = 'http://127.0.0.1:8080/login.php'                
+  AUTH_FORM_METHOD     = 'POST'                                          
+  AUTH_FORM_BODY       = 'username=admin&password=password&Login=Login&user_token={{CSRF}}' 
+  AUTH_FORM_HEADERS    = ''                                              
+  AUTH_CSRF_REGEX      = 'name=["'']user_token["'']\\s+value=["'']([^"'']+)' 
+  AUTH_CSRF_BODY_PLACEHOLDER = '{{CSRF}}'                                
+
+  AUTH_BASIC_USER   = ''   
+  AUTH_BASIC_PASS   = ''   
+  AUTH_BEARER_TOKEN = ''   
+  AUTH_COOKIE       = ''   
+  AUTH_COOKIE_CMD   = ''  
+
+
+  APP_START_CMD = "bash scripts/dvwa_up.sh" 
+
+  // ==========================================================================
+  //                   Health check 
+  // ==========================================================================
+  HEALTH_CHECK_PATH = '/'    
+
+  DAST_MODE = 'abort'        
+}
 
   stages {
 
@@ -219,21 +234,32 @@ SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG}
     }
 
     stage('Run DAST scan on DAST VM') {
-      options { timeout(time: 24, unit: 'HOURS') }
-      environment {
-        ZAP_IMAGE = "ghcr.io/zaproxy/zaproxy:stable"
-      }
-      steps {
-        script { if (env.DAST_MODE == 'abort') { milestone(40) } }
-        sh 'mkdir -p ${REPORT_DIR}'
+  options { timeout(time: 24, unit: 'HOURS') }
+  environment {
+    ZAP_IMAGE = "ghcr.io/zaproxy/zaproxy:stable"
+  }
+  steps {
+    script { if (env.DAST_MODE == 'abort') { milestone(40) } }
+    sh 'mkdir -p ${REPORT_DIR}'
 
-        sshagent(credentials: [env.DAST_SSH_CRED]) {
-          lock(resource: 'dast-scan', inversePrecedence: true) {
-            sh '''
+    sshagent(credentials: [env.DAST_SSH_CRED]) {
+      lock(resource: 'dast-scan', inversePrecedence: true) {
+        sh '''
 set -e
 SSH_OPTS='-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes'
 
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; export IMAGE_NAME='${IMAGE_NAME}'; export IMAGE_TAG='${IMAGE_TAG}'; export TARGET_URL='${TARGET_URL}'; export REPORT_HTML='${REPORT_HTML}'; export REPORT_JSON='${REPORT_JSON}'; export APP_CONTEXT='${APP_CONTEXT}'; export APP_LOGIN_URL='${APP_LOGIN_URL}'; export APP_USERNAME='${APP_USERNAME}'; export APP_PASSWORD='${APP_PASSWORD}'; bash -s" <<'BASH'
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; \
+  export IMAGE_NAME='${IMAGE_NAME}'; export IMAGE_TAG='${IMAGE_TAG}'; \
+  export TARGET_URL='${TARGET_URL}'; export REPORT_HTML='${REPORT_HTML}'; export REPORT_JSON='${REPORT_JSON}'; \
+  export APP_CONTEXT='${APP_CONTEXT}'; export APP_INTERNAL_PORT='${APP_INTERNAL_PORT}'; export APP_EXTERNAL_PORT='${APP_EXTERNAL_PORT}'; \
+  export APP_HEALTH_PATH='${APP_HEALTH_PATH}'; export APP_HEALTH_CODE='${APP_HEALTH_CODE}'; export APP_START_CMD='${APP_START_CMD}'; \
+  export AUTH_TYPE='${AUTH_TYPE}'; export AUTH_BASIC_USER='${AUTH_BASIC_USER}'; export AUTH_BASIC_PASS='${AUTH_BASIC_PASS}'; \
+  export AUTH_BEARER_TOKEN='${AUTH_BEARER_TOKEN}'; export AUTH_COOKIE='${AUTH_COOKIE}'; export AUTH_COOKIE_CMD='${AUTH_COOKIE_CMD}'; \
+  export AUTH_FORM_URL='${AUTH_FORM_URL}'; export AUTH_FORM_METHOD='${AUTH_FORM_METHOD}'; export AUTH_FORM_BODY='${AUTH_FORM_BODY}'; \
+  export AUTH_FORM_HEADERS='${AUTH_FORM_HEADERS}'; export AUTH_CSRF_REGEX='${AUTH_CSRF_REGEX}'; \
+  export AUTH_CSRF_BODY_PLACEHOLDER='${AUTH_CSRF_BODY_PLACEHOLDER}'; \
+  export ZAP_EXCLUDE_REGEX='${ZAP_EXCLUDE_REGEX}'; export ZAP_EXTRA='${ZAP_EXTRA}'; \
+  bash -s" <<'BASH'
 set -eu
 mkdir -p ~/dast_wrk
 
@@ -246,70 +272,126 @@ docker network create "$NET" >/dev/null 2>&1 || true
 echo ">>> Clean old containers"
 docker rm -f "$APP" >/dev/null 2>&1 || true
 
-echo ">>> Start application under test"
-docker run -d --name "$APP" --network "$NET" -p 8080:8080 \
-  "${IMAGE_NAME}:${IMAGE_TAG}"
+if [ -n "${APP_START_CMD:-}" ]; then
+  echo ">>> Running custom APP_START_CMD"
+  bash -lc "${APP_START_CMD}"
+else
+  echo ">>> Start application under test from built image"
+  docker run -d --name "$APP" --network "$NET" -p ${APP_EXTERNAL_PORT:-8080}:${APP_INTERNAL_PORT:-80} \
+    "${IMAGE_NAME}:${IMAGE_TAG}"
+fi
 
-# Wait for application to be ready
-echo ">>> Waiting for application to be ready..."
+HEALTH_URL="${TARGET_URL}${APP_CONTEXT:-}${APP_HEALTH_PATH:-/}"
+echo ">>> Waiting for application to be ready at ${HEALTH_URL}"
 for i in $(seq 1 60); do
-  if curl -sf "${TARGET_URL}${APP_CONTEXT}/" >/dev/null 2>&1; then
-    echo "Application is ready"
-    break
-  fi
-  echo "Waiting for application... ($i/60)"
-  sleep 5
+  CODE="$(curl -sk -o /dev/null -w '%{http_code}' "$HEALTH_URL" || true)"
+  case "$CODE" in
+    "${APP_HEALTH_CODE:-200}"|"302") echo "App is up ($CODE)"; break ;;
+    *) echo "Waiting ($i/60) code=$CODE"; sleep 5 ;;
+  esac
 done
 
-# Optional: Handle authentication if credentials are provided
-AUTH_CONFIG=""
-if [ -n "${APP_LOGIN_URL:-}" ] && [ -n "${APP_USERNAME:-}" ] && [ -n "${APP_PASSWORD:-}" ]; then
-  echo ">>> Setting up authentication context"
-  CJ=~/dast_wrk/cookies.txt
-  : > "$CJ"
-  
-  # Basic login attempt - customize based on your application
-  curl -sS -L -c "$CJ" -b "$CJ" \
-    -d "username=${APP_USERNAME}&password=${APP_PASSWORD}" \
-    "${TARGET_URL}${APP_LOGIN_URL}" || true
-    
-  # Extract session information if needed
-  if [ -f "$CJ" ]; then
-    COOKIES=$(awk 'NF==7 && $1!~/^#/ {printf "%s=%s; ", $6, $7}' "$CJ" | sed 's/; $//')
-    if [ -n "$COOKIES" ]; then
-      AUTH_CONFIG="-config replacer.full_list(0).description=AddAuthCookie
-        -config replacer.full_list(0).enabled=true
-        -config replacer.full_list(0).matchtype=REQ_HEADER
-        -config replacer.full_list(0).matchstr=Cookie
-        -config replacer.full_list(0).regex=false
-        -config 'replacer.full_list(0).replacement=${COOKIES}'"
+AUTH_ZAP_OPTS=""
+
+case "${AUTH_TYPE:-none}" in
+  basic)
+    if [ -n "${AUTH_BASIC_USER:-}" ] && [ -n "${AUTH_BASIC_PASS:-}" ]; then
+      B64=$(printf '%s:%s' "$AUTH_BASIC_USER" "$AUTH_BASIC_PASS" | base64 -w0)
+      AUTH_ZAP_OPTS="-config replacer.full_list(0).description=AuthBasic \
+                     -config replacer.full_list(0).enabled=true \
+                     -config replacer.full_list(0).matchtype=REQ_HEADER \
+                     -config replacer.full_list(0).matchstr=Authorization \
+                     -config replacer.full_list(0).regex=false \
+                     -config replacer.full_list(0).replacement=Basic ${B64}"
     fi
-  fi
-fi
+    ;;
+  bearer)
+    if [ -n "${AUTH_BEARER_TOKEN:-}" ]; then
+      AUTH_ZAP_OPTS="-config replacer.full_list(0).description=AuthBearer \
+                     -config replacer.full_list(0).enabled=true \
+                     -config replacer.full_list(0).matchtype=REQ_HEADER \
+                     -config replacer.full_list(0).matchstr=Authorization \
+                     -config replacer.full_list(0).regex=false \
+                     -config replacer.full_list(0).replacement=Bearer ${AUTH_BEARER_TOKEN}"
+    fi
+    ;;
+  cookie)
+    COOKIE_SRC="${AUTH_COOKIE:-}"
+    if [ -z "$COOKIE_SRC" ] && [ -n "${AUTH_COOKIE_CMD:-}" ]; then
+      COOKIE_SRC="$(bash -lc "${AUTH_COOKIE_CMD}" || true)"
+    fi
+    if [ -n "$COOKIE_SRC" ]; then
+      AUTH_ZAP_OPTS="-config replacer.full_list(0).description=AuthCookie \
+                     -config replacer.full_list(0).enabled=true \
+                     -config replacer.full_list(0).matchtype=REQ_HEADER \
+                     -config replacer.full_list(0).matchstr=Cookie \
+                     -config replacer.full_list(0).regex=false \
+                     -config replacer.full_list(0).replacement=${COOKIE_SRC}"
+    fi
+    ;;
+  form)
+    CJ=~/dast_wrk/cookies.txt
+    : > "$CJ"
+    BODY="${AUTH_FORM_BODY:-}"
+    if [ -n "${AUTH_CSRF_REGEX:-}" ]; then
+      PAGE="$(curl -skL "${AUTH_FORM_URL}")" || true
+      TOK="$(printf '%s' "$PAGE" | grep -oP "${AUTH_CSRF_REGEX}" | head -n1 || true)"
+      [ -n "$TOK" ] && BODY="${BODY//${AUTH_CSRF_BODY_PLACEHOLDER:-\{\{CSRF\}\}}/$TOK}"
+    fi
+    HARGS=()
+    if [ -n "${AUTH_FORM_HEADERS:-}" ]; then
+      IFS=';' read -r -a HDRS <<< "${AUTH_FORM_HEADERS}"
+      for h in "${HDRS[@]}"; do
+        htrim="$(echo "$h" | sed 's/^ *//;s/ *$//')"
+        [ -n "$htrim" ] && HARGS+=(-H "$htrim")
+      done
+    fi
+    curl -skL -c "$CJ" -b "$CJ" "${HARGS[@]}" \
+      -X "${AUTH_FORM_METHOD:-POST}" \
+      --data "$BODY" \
+      "${AUTH_FORM_URL}" >/dev/null || true
+
+    COOKIES="$(awk 'NF==7 && $1!~/^#/ {printf "%s=%s; ", $6, $7}' "$CJ" | sed 's/; $//')"
+    if [ -n "$COOKIES" ]; then
+      AUTH_ZAP_OPTS="-config replacer.full_list(0).description=AuthCookie \
+                     -config replacer.full_list(0).enabled=true \
+                     -config replacer.full_list(0).matchtype=REQ_HEADER \
+                     -config replacer.full_list(0).matchstr=Cookie \
+                     -config replacer.full_list(0).regex=false \
+                     -config replacer.full_list(0).replacement=${COOKIES}"
+    fi
+    ;;
+  none|*)
+    :
+    ;;
+esac
 
 echo ">>> Pull ZAP image"
 docker pull "${ZAP_IMAGE}" || true
 
+EXC="${ZAP_EXCLUDE_REGEX:-.*logout.*}"
+ZAP_Z=""
+[ -n "$AUTH_ZAP_OPTS" ] && ZAP_Z="-z $AUTH_ZAP_OPTS"
+
 echo ">>> Run ZAP DAST scan"
 docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "${ZAP_IMAGE}" \
   zap-full-scan.py -j \
-    -t "${TARGET_URL}${APP_CONTEXT}" \
-    -x ".*logout.*" \
+    -t "${TARGET_URL}${APP_CONTEXT:-}" \
+    -x "$EXC" \
     -r "/zap/wrk/${REPORT_HTML}" \
     -J "/zap/wrk/${REPORT_JSON}" \
-    ${AUTH_CONFIG:+-z "$AUTH_CONFIG"} || true
-
-echo ">>> DAST scan completed"
+    ${ZAP_Z} ${ZAP_EXTRA:-} || true
 BASH
 
-# Copy reports back to Jenkins
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
 '''
-          }
-        }
       }
     }
+  }
+}
+
+
 
     stage('Collect & Normalize findings') {
       when {
@@ -352,7 +434,7 @@ python3 create_issues_grouped.py
     stage('Deploy to App VM') {
       steps {
         script { if (env.DAST_MODE == 'abort') { milestone(50) } }
-        sshagent(credentials: ['dast_ssh_cred_id', 'app']) {
+        sshagent(credentials: [env.DAST_SSH_CRED, env.APP_SSH_CRED]) {
           sh '''#!/usr/bin/env bash
 set -eu
 SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
@@ -385,7 +467,7 @@ else
   ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "
     docker stop app-container 2>/dev/null || true
     docker rm app-container 2>/dev/null || true
-    docker run -d --name app-container -p 8080:8080 ${IMAGE_NAME}:${IMAGE_TAG}
+    docker run -d --name app-container -p 8080:80 ${IMAGE_NAME}:${IMAGE_TAG}
   "
 fi
 '''
