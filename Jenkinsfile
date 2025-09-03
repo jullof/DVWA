@@ -392,7 +392,6 @@ case "${AUTH_TYPE:-none}" in
   none|*)
     :
     ;;
-endcase_dummy_to_keep_indentation
 esac
 
 echo ">>> Pull ZAP image"
