@@ -257,9 +257,9 @@ ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} 'mkdir -p ~/dast_wrk'
 if [ -f scripts/dvwa_up.sh ]; then
   scp $SSH_OPTS scripts/dvwa_up.sh ${DAST_USER}@${DAST_HOST}:~/dast_wrk/dvwa_up.sh
   ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} 'chmod +x ~/dast_wrk/dvwa_up.sh'
-  APP_START_CMD_REMOTE="IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} bash ~/dast_wrk/dvwa_up.sh"
+  HAS_DVWA_UP="1"
 else
-  APP_START_CMD_REMOTE="${APP_START_CMD}"
+  HAS_DVWA_UP=""
 fi
 
 ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; \
@@ -267,7 +267,6 @@ ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; \
   export TARGET_URL='${TARGET_URL}'; export REPORT_HTML='${REPORT_HTML}'; export REPORT_JSON='${REPORT_JSON}'; \
   export APP_CONTEXT='${APP_CONTEXT}'; export APP_INTERNAL_PORT='${APP_INTERNAL_PORT}'; export APP_EXTERNAL_PORT='${APP_EXTERNAL_PORT}'; \
   export APP_HEALTH_PATH='${APP_HEALTH_PATH}'; export APP_HEALTH_CODE='${APP_HEALTH_CODE}'; \
-  export APP_START_CMD=\"${APP_START_CMD_REMOTE}\"; \
   export AUTH_TYPE='${AUTH_TYPE}'; export AUTH_BASIC_USER='${AUTH_BASIC_USER}'; export AUTH_BASIC_PASS='${AUTH_BASIC_PASS}'; \
   export AUTH_BEARER_TOKEN='${AUTH_BEARER_TOKEN}'; export AUTH_COOKIE='${AUTH_COOKIE}'; export AUTH_COOKIE_CMD='${AUTH_COOKIE_CMD}'; \
   export AUTH_FORM_URL='${AUTH_FORM_URL}'; export AUTH_FORM_METHOD='${AUTH_FORM_METHOD}'; export AUTH_FORM_BODY='${AUTH_FORM_BODY}'; \
@@ -275,6 +274,7 @@ ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; \
   export AUTH_CSRF_REGEX_B64='${REGEX_B64}'; \
   export AUTH_CSRF_BODY_PLACEHOLDER='${AUTH_CSRF_BODY_PLACEHOLDER}'; \
   export ZAP_EXCLUDE_REGEX='${ZAP_EXCLUDE_REGEX}'; export ZAP_EXTRA='${ZAP_EXTRA}'; \
+  export HAS_DVWA_UP='${HAS_DVWA_UP}'; \
   bash -s" <<'BASH'
 
 set -eu
@@ -282,18 +282,19 @@ mkdir -p ~/dast_wrk
 
 NET="app-net"
 APP="app-under-test"
+DB="dvwa-db"
 
 echo ">>> Ensure network"
 docker network create "$NET" >/dev/null 2>&1 || true
 
 echo ">>> Clean old containers"
-docker rm -f "$APP" >/dev/null 2>&1 || true
+docker rm -f "$APP" "$DB" >/dev/null 2>&1 || true
 
-if [ -n "${APP_START_CMD:-}" ]; then
-  echo ">>> Running custom APP_START_CMD"
-  bash -lc "${APP_START_CMD}"
+if [ -n "${HAS_DVWA_UP:-}" ] && [ -f ~/dast_wrk/dvwa_up.sh ]; then
+  echo ">>> Running dvwa_up.sh"
+  IMAGE_NAME="${IMAGE_NAME}" IMAGE_TAG="${IMAGE_TAG}" bash ~/dast_wrk/dvwa_up.sh
 else
-  echo ">>> Start application under test from built image"
+  echo ">>> Start application under test from built image (simple fallback)"
   docker run -d --name "$APP" --network "$NET" -p ${APP_EXTERNAL_PORT:-8080}:${APP_INTERNAL_PORT:-80} \
     "${IMAGE_NAME}:${IMAGE_TAG}"
 fi
@@ -391,6 +392,7 @@ case "${AUTH_TYPE:-none}" in
   none|*)
     :
     ;;
+endcase_dummy_to_keep_indentation
 esac
 
 echo ">>> Pull ZAP image"
@@ -413,6 +415,7 @@ BASH
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
 '''
+
 
       }
     }
