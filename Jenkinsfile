@@ -248,17 +248,19 @@ SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG}
 set -e
 SSH_OPTS='-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes'
 
-# ---- ship dvwa_up.sh to DAST VM (if exists) ----
+REGEX_B64="$(printf '%s' "${AUTH_CSRF_REGEX}" | base64 -w0 2>/dev/null || true)"
+if [ -z "$REGEX_B64" ] && [ -n "${AUTH_CSRF_REGEX:-}" ]; then
+  REGEX_B64="$(printf '%s' "${AUTH_CSRF_REGEX}" | base64)"
+fi
+
 ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} 'mkdir -p ~/dast_wrk'
 if [ -f scripts/dvwa_up.sh ]; then
   scp $SSH_OPTS scripts/dvwa_up.sh ${DAST_USER}@${DAST_HOST}:~/dast_wrk/dvwa_up.sh
   ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} 'chmod +x ~/dast_wrk/dvwa_up.sh'
   APP_START_CMD_REMOTE="IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} bash ~/dast_wrk/dvwa_up.sh"
 else
-  # fall back to what you set in env (may be empty or another command)
   APP_START_CMD_REMOTE="${APP_START_CMD}"
 fi
-
 
 ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; \
   export IMAGE_NAME='${IMAGE_NAME}'; export IMAGE_TAG='${IMAGE_TAG}'; \
@@ -269,7 +271,8 @@ ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "export ZAP_IMAGE='${ZAP_IMAGE}'; \
   export AUTH_TYPE='${AUTH_TYPE}'; export AUTH_BASIC_USER='${AUTH_BASIC_USER}'; export AUTH_BASIC_PASS='${AUTH_BASIC_PASS}'; \
   export AUTH_BEARER_TOKEN='${AUTH_BEARER_TOKEN}'; export AUTH_COOKIE='${AUTH_COOKIE}'; export AUTH_COOKIE_CMD='${AUTH_COOKIE_CMD}'; \
   export AUTH_FORM_URL='${AUTH_FORM_URL}'; export AUTH_FORM_METHOD='${AUTH_FORM_METHOD}'; export AUTH_FORM_BODY='${AUTH_FORM_BODY}'; \
-  export AUTH_FORM_HEADERS='${AUTH_FORM_HEADERS}'; export AUTH_CSRF_REGEX='${AUTH_CSRF_REGEX}'; \
+  export AUTH_FORM_HEADERS='${AUTH_FORM_HEADERS}'; \
+  export AUTH_CSRF_REGEX_B64='${REGEX_B64}'; \
   export AUTH_CSRF_BODY_PLACEHOLDER='${AUTH_CSRF_BODY_PLACEHOLDER}'; \
   export ZAP_EXCLUDE_REGEX='${ZAP_EXCLUDE_REGEX}'; export ZAP_EXTRA='${ZAP_EXTRA}'; \
   bash -s" <<'BASH'
@@ -310,7 +313,7 @@ AUTH_ZAP_OPTS=""
 case "${AUTH_TYPE:-none}" in
   basic)
     if [ -n "${AUTH_BASIC_USER:-}" ] && [ -n "${AUTH_BASIC_PASS:-}" ]; then
-      B64=$(printf '%s:%s' "$AUTH_BASIC_USER" "$AUTH_BASIC_PASS" | base64 -w0)
+      B64=$(printf '%s:%s' "$AUTH_BASIC_USER" "$AUTH_BASIC_PASS" | base64 -w0 2>/dev/null || printf '%s:%s' "$AUTH_BASIC_USER" "$AUTH_BASIC_PASS" | base64)
       AUTH_ZAP_OPTS="-config replacer.full_list(0).description=AuthBasic \
                      -config replacer.full_list(0).enabled=true \
                      -config replacer.full_list(0).matchtype=REQ_HEADER \
@@ -343,11 +346,14 @@ case "${AUTH_TYPE:-none}" in
                      -config replacer.full_list(0).replacement=${COOKIE_SRC}"
     fi
     ;;
-    form)
+  form)
     CJ=~/dast_wrk/cookies.txt
     : > "$CJ"
     BODY="${AUTH_FORM_BODY:-}"
 
+    if [ -n "${AUTH_CSRF_REGEX_B64:-}" ]; then
+      AUTH_CSRF_REGEX="$(printf '%s' "$AUTH_CSRF_REGEX_B64" | base64 -d 2>/dev/null || true)"
+    fi
     if [ -n "${AUTH_CSRF_REGEX:-}" ]; then
       PAGE="$(curl -skL "${AUTH_FORM_URL}")" || true
       TOK="$(printf '%s' "$PAGE" | grep -oP "${AUTH_CSRF_REGEX}" | head -n1 || true)"
@@ -358,7 +364,6 @@ case "${AUTH_TYPE:-none}" in
       fi
     fi
 
-    # İsteğe bağlı ek header'lar
     HARGS=()
     if [ -n "${AUTH_FORM_HEADERS:-}" ]; then
       IFS=';' read -r -a HDRS <<< "${AUTH_FORM_HEADERS}"
@@ -383,7 +388,9 @@ case "${AUTH_TYPE:-none}" in
                      -config replacer.full_list(0).replacement=${COOKIES}"
     fi
     ;;
-
+  none|*)
+    :
+    ;;
 esac
 
 echo ">>> Pull ZAP image"
@@ -406,6 +413,7 @@ BASH
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
 '''
+
       }
     }
   }
