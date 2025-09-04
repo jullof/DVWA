@@ -451,7 +451,7 @@ python3 create_issues_grouped.py
     stage('Deploy to App VM') {
   steps {
     milestone 50
-    sshagent(credentials: ['dast','app']) {
+    sshagent(credentials: [env.APP_SSH_CRED]) {
       sh '''
         set -e
         docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip | \

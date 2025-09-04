@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# ai_triage.py (GEMINI-ONLY, cost-optimized)
-import os, sys, json, time, hashlib, urllib.request, urllib.error
+# ai_triage.py (Gemini-only, EN-only, hardened prompt + tiny fallback)
+import os, sys, json, time, hashlib, urllib.request, urllib.error, re
 from collections import defaultdict
 
 REPORT_DIR = os.environ.get("REPORT_DIR","reports")
@@ -20,28 +20,19 @@ AI_BATCH_SIZE      = int(os.environ.get("AI_BATCH_SIZE","25"))
 AI_SLEEP_BETWEEN   = float(os.environ.get("AI_SLEEP_BETWEEN","1.0"))
 
 # ---------- helpers ----------
-
-import re
-
-
 CTRL_CHARS_RGX = re.compile(r'[\x00-\x1f\x7f]')
 
 def clean_text(s: str) -> str:
     if not isinstance(s, str):
         s = str(s or "")
-    # kontrol karakterleri ve NULL'lar
-    s = CTRL_CHARS_RGX.sub(' ', s)
-    # kimi modeller ```json ... ``` ile çitliyor
-    s = s.strip()
+    s = CTRL_CHARS_RGX.sub(' ', s).strip()
     if s.startswith("```"):
         s = s.strip("`")
-        # ilk satır "json" yazıyorsa at
         if s.startswith("json"):
             s = s[4:].lstrip()
     return s.strip()
 
 def extract_json_block(s: str) -> str:
-    """Metin içinden en geniş { ... } bloğunu kaba kuvvetle çıkar."""
     s = clean_text(s)
     start = s.find('{')
     end   = s.rfind('}')
@@ -53,18 +44,8 @@ def safe_json_loads(s: str):
     s = extract_json_block(s)
     try:
         return json.loads(s)
-    except json.JSONDecodeError:
-        # Çok kaba kurtarma: sonuna } ekleme denemesi
-        s2 = s.rstrip()
-        if not s2.endswith('}'):
-            s2 += '}'
-            try:
-                return json.loads(s2)
-            except Exception:
-                pass
-        # tamamen başarısızsa boş obje dön
+    except Exception:
         return {}
-
 
 def _lower(s): return (s or "").lower()
 def digest(*parts):
@@ -72,6 +53,7 @@ def digest(*parts):
     for p in parts: h.update((_lower(str(p))).encode("utf-8","ignore"))
     return h.hexdigest()[:12]
 
+# Class heuristics
 PLUGIN_XSS  = {"40012","40014","40016","40017","40026"}
 PLUGIN_SQLI = {"40018","40019","40020","40021","40022","40024","40027"}
 PLUGIN_RCE  = {"90020","20018"}
@@ -109,14 +91,21 @@ for it in items:
     f = dict(it or {})
     src  = f.get("source") or f.get("scanner") or f.get("tool") or "unknown"
     sev  = norm_sev(f.get("severity") or f.get("risk") or f.get("level") or "")
-    url  = clean_text(f.get("url") or f.get("target") or f.get("endpoint") or "")
+
+    loc  = f.get("location") or {}
+    url  = clean_text(
+        f.get("url") or f.get("target") or f.get("endpoint") or loc.get("url") or ""
+    )
+    param= clean_text(f.get("param") or loc.get("param") or "")
+
     name = clean_text(f.get("name") or f.get("title") or f.get("rule") or "Finding")
     plug = f.get("pluginId") or f.get("pluginid") or f.get("rule_id") or f.get("id") or ""
-    param = clean_text(f.get("param") or "")
-    cwe = f.get("cwe") or f.get("cweId") or ""
-    ev  = clean_text(f.get("evidence") or f.get("evidenceSnippet") or "")
+    cwe  = f.get("cwe") or f.get("cweId") or ""
+    ev   = clean_text(f.get("evidence") or f.get("evidenceSnippet") or "")
+
     klass = classify(name, plug, cwe)
     fid = f.get("id") or f.get("fingerprint") or f"{src}-{plug}-{digest(url,name,param or ev)}"
+
     norm.append({
         "id": fid,
         "source": src,
@@ -132,14 +121,13 @@ for it in items:
         "class": klass
     })
 
-
 # dedup
 seen, dedup = set(), []
 for f in norm:
     if f["id"] in seen: continue
     seen.add(f["id"]); dedup.append(f)
 
-# ---------- throttle by severity / cap count ----------
+# throttle by severity / cap
 if AI_ONLY_SEVERITIES:
     dedup = [x for x in dedup if (x.get("severity","").lower() in AI_ONLY_SEVERITIES)]
 if AI_MAX_FINDINGS and len(dedup) > AI_MAX_FINDINGS:
@@ -154,22 +142,54 @@ if AI_MAX_FINDINGS and len(dedup) > AI_MAX_FINDINGS:
     dedup = pooled[:AI_MAX_FINDINGS]
 
 # ---------- Gemini call ----------
+def build_prompt(payload_items):
+    """
+    Strong, English-only, schema-enforced prompt.
+    """
+    policy = (
+        "You are an Application Security triage assistant. "
+        "Write EVERYTHING in English. Do NOT include any Turkish. "
+        "For each finding, produce concise, technical, actionable guidance focused on exploitability and risk.\n\n"
+        "Return ONLY a single JSON object keyed by finding id. No prose, no Markdown, no code fences.\n\n"
+        "For each id include EXACTLY these keys:\n"
+        " - ai_priority: one of P0, P1, P2, P3, P4 (P0 highest). Base on realistic risk + exploit path.\n"
+        " - ai_suspected_fp: boolean (true/false) if likely false positive.\n"
+        " - why_opened: <=2 sentences, specific exploit path & impact; mention affected parameter if present; no generic text.\n"
+        " - remediation: a numbered list (4-6 items) of concrete steps (server-side validation, headers, framework configs, test ideas). "
+        "   Each step must be imperative and specific; avoid generic 'review/test'.\n"
+        " - references: 2-4 reputable URLs (OWASP Cheat Sheets/Top10, CWE, MDN, vendor docs). No random blogs, no duplicates.\n"
+        " - where: a single line summarizing target location (URL + param if any), e.g. `/login.php?user`.\n\n"
+        "Rules:\n"
+        " - Keep outputs minimal but actionable. No placeholders like N/A; if unknown, omit the detail but keep the key.\n"
+        " - Do not invent endpoints that are not in the input. Only summarize what is given.\n"
+        " - Never output Markdown or text outside the JSON.\n"
+    )
+
+    # provide input explicitly
+    user = {"findings": payload_items}
+    return policy, json.dumps(user, ensure_ascii=False)
+
 def call_gemini(batch):
     payload_items = []
     for x in batch:
-        ev = clean_text((x.get("evidence","") or ""))[:160].replace("\n"," ")
-        title = clean_text(x.get("title",""))
-        url = (x.get("url") or "N/A")
-        desc = f"{title} | sev={x['severity']} | url={url} | ev={ev}"
-        payload_items.append({"id": x["id"], "d": desc})
+        ev  = clean_text((x.get("evidence","") or ""))[:200].replace("\n"," ")
+        tit = clean_text(x.get("title",""))
+        url = (x.get("url") or "")
+        prm = (x.get("param") or "")
+        desc = {
+            "id": x["id"],
+            "title": tit,
+            "severity": x["severity"],
+            "url": url,
+            "param": prm,
+            "evidence": ev,
+            "pluginId": x.get("pluginId",""),
+            "cwe": x.get("cwe",""),
+            "class": x.get("class","other")
+        }
+        payload_items.append(desc)
 
-    sys_prompt = (
-        "You are a security triage assistant. For each finding id, return a JSON object keyed by id "
-        "with fields: ai_priority (P0..P4), ai_suspected_fp (boolean), why_opened ('<=2 sentences'), "
-        "remediation ('<=4 numbered steps'), references (array with up to 2 reputable URLs). "
-        "Return ONLY a JSON object and nothing else."
-    )
-    user_payload = json.dumps({"findings": payload_items}, ensure_ascii=False)
+    sys_prompt, user_payload = build_prompt(payload_items)
 
     url = f"{GEMINI_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     body = {
@@ -178,7 +198,7 @@ def call_gemini(batch):
         ],
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 1200,
+            "maxOutputTokens": 1600,
             "responseMimeType": "application/json"
         }
     }
@@ -203,28 +223,25 @@ def call_gemini(batch):
                 return {}
             return safe_json_loads(text)
         except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="ignore")
-            print(f"HTTP Error (Gemini): {e.code} - {e.reason}\nResponse: {body}")
-            if e.code == 429 or "quota" in body.lower() or "insufficient" in body.lower():
+            body_txt = e.read().decode(errors="ignore")
+            print(f"HTTP Error (Gemini): {e.code} - {e.reason}\nResponse: {body_txt}")
+            if e.code == 429 or "quota" in body_txt.lower() or "insufficient" in body_txt.lower():
                 return "__ABORT_ALL__"
             if e.code >= 500:
-                time.sleep(1.5 + attempt)
-                continue
+                time.sleep(1.5 + attempt); continue
             return {}
-
         except Exception as e:
             print(f"Unexpected error (Gemini): {e}")
             time.sleep(1.0 + 0.5*attempt)
             continue
     return {}
 
-
 # ---------- short-circuit if no key ----------
 if not GEMINI_API_KEY:
     os.makedirs(REPORT_DIR, exist_ok=True)
     with open(OUT_PATH,"w",encoding="utf-8") as fh: json.dump(dedup, fh, ensure_ascii=False, indent=2)
     with open(BODIES_OUT,"w",encoding="utf-8") as fh: json.dump(
-        {k:{"body":f"**{k.upper()}**: No AI triage (no GEMINI_API_KEY)."} for k in ("xss","sqli","rce","other")},
+        {k:{"body":f"**{k.upper()}**: No findings.\nGenerated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"} for k in ("xss","sqli","rce","other")},
         fh, ensure_ascii=False, indent=2
     )
     print("[AI] skipped: GEMINI_API_KEY not set -> wrote pass-through outputs.")
@@ -248,7 +265,16 @@ if dedup:
 else:
     print("[AI] nothing to triage after filtering/grouping.")
 
-# ---------- merge & write ----------
+# ---------- tiny generic fallbacks ----------
+def tiny_fallback_why(x):
+    prm = x.get("param","")
+    if prm:
+        return f"Potentially exploitable via user-controlled parameter '{prm}'. Needs validation & authorization."
+    return "Potentially exploitable user input or misconfiguration. Needs validation & authorization."
+
+def tiny_fallback_rem():
+    return "1) Validate and sanitize inputs server-side  2) Enforce authorization per action  3) Add negative tests  4) Re-test and deploy"
+
 def default_refs():
     return [
         "https://owasp.org/www-project-top-ten/",
@@ -256,18 +282,27 @@ def default_refs():
         "https://cheatsheetseries.owasp.org/"
     ]
 
+# ---------- merge & write ----------
 enriched = []
 for f in dedup:
-    finding_id = f["id"]
-    ai = ai_results.get(finding_id, {}) or {}
-    remediation = (ai.get("remediation") or "").strip() or "1) İnceleyin  2) Uygun düzeltmeleri yapın  3) Test edin  4) Yayına alın"
+    fid = f["id"]
+    ai = ai_results.get(fid, {}) or {}
+    # normalize references (list[str])
     refs = ai.get("references")
     if isinstance(refs, str):
         refs = [refs]
-    if not refs:
+    if not isinstance(refs, list) or not refs:
         refs = default_refs()
 
+    remediation = ai.get("remediation")
+    if isinstance(remediation, list):
+        remediation = "\n".join(f"{i+1}) {clean_text(step)}" for i, step in enumerate(remediation[:6]))
+    remediation = clean_text(remediation or "") or tiny_fallback_rem()
 
+    why = clean_text(ai.get("why_opened","")) or tiny_fallback_why(f)
+    where = clean_text(ai.get("where","")) or clean_text(
+        f"{(f.get('url') or '')}{('?'+f.get('param')) if f.get('param') else ''}"
+    )
 
     prov = {
         "source": f["source"],
@@ -277,13 +312,15 @@ for f in dedup:
         "params": [p for p in {f.get("param")} if p],
         "evidence": [e for e in {f.get("evidence")} if e]
     }
+
     enriched.append({
         **f,
         "ai_priority": ai.get("ai_priority","P3"),
         "ai_suspected_fp": bool(ai.get("ai_suspected_fp", False)),
-        "why_opened": ai.get("why_opened","Manual review recommended."),
+        "why_opened": why,
         "remediation": remediation,
         "references": refs,
+        "where": where,
         "provenance": prov
     })
 
@@ -302,10 +339,9 @@ def table(rows, headers):
         out.append("| " + " | ".join(_cell(x) for x in r) + " |")
     return "\n".join(out)
 
-
-now = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.gmtime())
+now = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 bodies = {}
-for klass in ("xss", "sqli", "rce", "other"):
+for klass in ("xss","sqli","rce","other"):
     items = groups.get(klass, [])
     if not items:
         bodies[klass] = {"body": f"**{klass.upper()}**: No findings.\nGenerated: {now}"}
@@ -314,47 +350,36 @@ for klass in ("xss", "sqli", "rce", "other"):
     uniq, rows = set(), []
     for x in items:
         key = (x.get("pluginId"), x.get("url"))
-        if key in uniq:
-            continue
+        if key in uniq: continue
         uniq.add(key)
-        rows.append((x["severity"], x["title"], x.get("url", ""), x.get("ai_priority", "P3")))
-        if len(rows) >= 15:
-            break
+        rows.append((x["severity"], x["title"], x.get("where",""), x.get("ai_priority","P3")))
+        if len(rows) >= 15: break
 
     details = []
     for x in items[:80]:
         prov = x.get("provenance") or {}
         urls = ", ".join(prov.get("urls") or ([x.get("url")] if x.get("url") else []))
-
         raw_refs = x.get("references") or []
-        if isinstance(raw_refs, str):
-            raw_refs = [raw_refs]
+        if isinstance(raw_refs, str): raw_refs = [raw_refs]
         refs_list = [clean_text(r) for r in raw_refs[:6]]
         refs_md = "".join(f"\n  - {r}" for r in refs_list)
-
-        title_safe = clean_text(x.get("title", ""))
-        why_safe   = clean_text(x.get("why_opened", ""))
-        rem_safe   = clean_text(x.get("remediation", ""))
-
         details.append(
-f"""- **{title_safe}** (`{x.get('severity','')}`, {x.get('ai_priority','P3')})
-  - **Why:** {why_safe}
-  - **Where:** {urls}
+f"""- **{clean_text(x.get('title',''))}** (`{x.get('severity','')}`, {x.get('ai_priority','P3')})
+  - **Why:** {clean_text(x.get('why_opened',''))}
+  - **Where:** {clean_text(x.get('where','')) or urls}
   - **Rule/Plugin:** {prov.get('rule_or_plugin','')}
   - **Evidence:** {", ".join((prov.get("evidence") or [])[:2])}
-  - **Remediation:** {rem_safe}
+  - **Remediation:** {clean_text(x.get('remediation',''))}
   - **References:**{refs_md}"""
         )
 
     body = (
-        f"{table(rows, ['Severity','Title','URL','Priority'])}\n\n"
+        f"{table(rows, ['Severity','Title','Where','Priority'])}\n\n"
         f"<details><summary>Details (first 80)</summary>\n\n"
         + "\n\n".join(details)
         + f"\n\n</details>\n\nGenerated: {now}"
     )
     bodies[klass] = {"body": body}
-
-
 
 os.makedirs(REPORT_DIR, exist_ok=True)
 with open(OUT_PATH,"w",encoding="utf-8") as fh: json.dump(enriched, fh, ensure_ascii=False, indent=2)
