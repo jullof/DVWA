@@ -454,8 +454,12 @@ python3 create_issues_grouped.py
     sshagent(credentials: [env.APP_SSH_CRED]) {
       sh '''
         set -e
+
         docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip | \
-          ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} gunzip | docker load
+          ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} 'gunzip | docker load'
+
+        ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} "\
+          docker image inspect ${IMAGE_NAME}:${IMAGE_TAG} >/dev/null 2>&1 || { echo 'Image not present on remote'; exit 1; }"
 
         scp -o StrictHostKeyChecking=no scripts/deploy_app.sh ${APP_USER}@${APP_HOST}:/tmp/deploy_app.sh
         ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} "\
@@ -467,6 +471,7 @@ python3 create_issues_grouped.py
       '''
     }
   }
+}
 }
 
 
