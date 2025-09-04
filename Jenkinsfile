@@ -472,7 +472,7 @@ python3 create_issues_grouped.py
     }
   }
 }
-}
+
 
 
     stage('Health check') {
