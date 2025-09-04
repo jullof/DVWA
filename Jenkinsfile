@@ -8,75 +8,67 @@ pipeline {
     timeout(time: 30, unit: 'HOURS')
   }
 
+  environment {
+    APP_HOST   = '192.168.191.132'
+    APP_USER   = 'app'
+    APP_SSH_CRED = 'app'
+    DEPLOY_DIR = '/opt/app'
 
+    DAST_HOST     = '192.168.191.133'
+    DAST_USER     = 'dast'
+    DAST_SSH_CRED = 'dast_ssh_cred_id'
 
-environment {
-  APP_HOST   = '192.168.191.132'     
-  APP_USER   = 'app'                
-  APP_SSH_CRED = 'app' 
-  DEPLOY_DIR = '/opt/app'          
+    IMAGE_NAME = 'app-local'
+    IMAGE_TAG  = "${env.BUILD_NUMBER}"
+    REPORT_DIR  = 'reports'
+    REPORT_HTML = 'zap_report.html'
+    REPORT_JSON = 'zap_report.json'
+    GITHUB_TOKEN_CRED = 'github_token_cred_id'
+    GITHUB_REPO       = 'jullof/DVWA'
 
-  DAST_HOST     = '192.168.191.133' 
-  DAST_USER     = 'dast'             
-  DAST_SSH_CRED = 'dast_ssh_cred_id'
+    // ------------ AI (Gemini) ------------
+    USE_AI            = 'true'
+    SHOW_RECOM        = 'true'
+    AI_THRESHOLD      = '0.6'
+    GEMINI_MODEL      = 'gemini-1.5-flash'
+    GEMINI_BASE       = 'https://generativelanguage.googleapis.com/v1beta/models'
+    AI_ONLY_SEVERITIES = 'medium,high,critical'
+    AI_MAX_FINDINGS    = '150'
+    AI_BATCH_SIZE      = '25'
+    AI_SLEEP_BETWEEN   = '1.0'
 
-  IMAGE_NAME = 'app-local'          
-  IMAGE_TAG  = "${env.BUILD_NUMBER}" 
-  REPORT_DIR  = 'reports'            
-  REPORT_HTML = 'zap_report.html'    
-  REPORT_JSON = 'zap_report.json'    
-  GITHUB_TOKEN_CRED = 'github_token_cred_id' 
-  GITHUB_REPO       = 'jullof/DVWA'         
+    // ------------ App / DAST ------------
+    TARGET_URL        = 'http://127.0.0.1:8080'
+    APP_CONTEXT       = ''
+    APP_INTERNAL_PORT = '80'
+    APP_EXTERNAL_PORT = '8080'
+    APP_HEALTH_PATH   = '/login.php'
+    APP_HEALTH_CODE   = '200'
+    ZAP_EXCLUDE_REGEX = '.*logout.*|.*setup.*'
+    ZAP_EXTRA         = ''
 
-   // ------------ AI (Gemini) ------------
-  USE_AI            = 'true'                   
-  SHOW_RECOM        = 'true'
-  AI_THRESHOLD      = '0.6'                    
+    AUTH_TYPE            = 'form'
+    AUTH_FORM_URL        = 'http://127.0.0.1:8080/login.php'
+    AUTH_FORM_METHOD     = 'POST'
+    AUTH_FORM_BODY       = 'username=admin&password=password&Login=Login&user_token={{CSRF}}'
+    AUTH_FORM_HEADERS    = ''
+    AUTH_CSRF_REGEX = "name=[\"']user_token[\"']\\s+value=[\"']\\K[^\"']+"
+    AUTH_CSRF_BODY_PLACEHOLDER = '{{CSRF}}'
 
-  GEMINI_MODEL      = 'gemini-1.5-flash'
-  GEMINI_BASE       = 'https://generativelanguage.googleapis.com/v1beta/models'
+    AUTH_BASIC_USER   = ''
+    AUTH_BASIC_PASS   = ''
+    AUTH_BEARER_TOKEN = ''
+    AUTH_COOKIE       = ''
+    AUTH_COOKIE_CMD   = ''
 
-  AI_ONLY_SEVERITIES = 'medium,high,critical'  
-  AI_MAX_FINDINGS    = '150'                  
-  AI_BATCH_SIZE      = '25'
-  AI_SLEEP_BETWEEN   = '1.0'
+    APP_START_CMD = "bash scripts/dvwa_up.sh"
 
+    // Health check
+    HEALTH_CHECK_PATH = '/'
 
-  // ==========================================================================
-  // ==========================================================================
-  TARGET_URL        = 'http://127.0.0.1:8080' 
-  APP_CONTEXT       = ''                     
-  APP_INTERNAL_PORT = '80'                  
-  APP_EXTERNAL_PORT = '8080'                 
-  APP_HEALTH_PATH   = '/login.php'           
-  APP_HEALTH_CODE   = '200'                   
-  ZAP_EXCLUDE_REGEX = '.*logout.*|.*setup.*' 
-  ZAP_EXTRA         = ''                      
-
-  AUTH_TYPE            = 'form'                                        
-  AUTH_FORM_URL        = 'http://127.0.0.1:8080/login.php'                
-  AUTH_FORM_METHOD     = 'POST'                                          
-  AUTH_FORM_BODY       = 'username=admin&password=password&Login=Login&user_token={{CSRF}}' 
-  AUTH_FORM_HEADERS    = ''                                              
-  AUTH_CSRF_REGEX = "name=[\"']user_token[\"']\\s+value=[\"']\\K[^\"']+"
-  AUTH_CSRF_BODY_PLACEHOLDER = '{{CSRF}}'                                
-
-  AUTH_BASIC_USER   = ''   
-  AUTH_BASIC_PASS   = ''   
-  AUTH_BEARER_TOKEN = ''   
-  AUTH_COOKIE       = ''   
-  AUTH_COOKIE_CMD   = ''  
-
-
-  APP_START_CMD = "bash scripts/dvwa_up.sh" 
-
-  // ==========================================================================
-  //                   Health check 
-  // ======================================================== ==================
-  HEALTH_CHECK_PATH = '/'    
-
-  DAST_MODE = 'abort'        
-}
+    // Policy
+    DAST_MODE = 'abort'
+  }
 
   stages {
 
@@ -88,7 +80,7 @@ environment {
             returnStdout: true, label: 'compute-policy-mode',
             script: '''
 python3 - <<'PY'
-import json, os, time, sys
+import json, os, time
 policy_file = "/var/lib/jenkins/dast_policy.json"
 now = int(time.time())
 
@@ -107,9 +99,9 @@ ws   = int(data.get("window_start", now))
 
 if mode == "abort" and (now - ws) >= 86400:  # 24h
     data["mode"] = "freeze"
-    mode = "freeze"
     with open(policy_file, "w", encoding="utf-8") as f:
         json.dump(data, f)
+    mode = "freeze"
 
 print(mode)
 PY
@@ -124,22 +116,19 @@ PY
       steps {
         script {
           if (env.DAST_MODE == 'abort') {
-            // First 24 hours: If new build comes, abort current one
             properties([disableConcurrentBuilds(abortPrevious: true)])
             echo 'Concurrency: ABORT mode → abortPrevious=TRUE'
           } else {
-            // After 24 hours (freeze): No parallel builds, but don't stop ongoing 
             properties([disableConcurrentBuilds()])
             echo 'Concurrency: FREEZE mode → abortPrevious=FALSE'
           }
         }
       }
     }
-  //
+
     stage('Checkout') {
       steps {
         script { if (env.DAST_MODE == 'abort') { milestone(10) } }
-        // Generic SCM checkout - will use the configured SCM in Jenkins job
         checkout scm
       }
     }
@@ -241,17 +230,15 @@ SNYK_TOKEN=$SNYK_TOKEN "$PWD/bin/snyk" container test ${IMAGE_NAME}:${IMAGE_TAG}
     }
 
     stage('Run DAST scan on DAST VM') {
-  options { timeout(time: 24, unit: 'HOURS') }
-  environment {
-    ZAP_IMAGE = "ghcr.io/zaproxy/zaproxy:stable"
-  }
-  steps {
-    script { if (env.DAST_MODE == 'abort') { milestone(40) } }
-    sh 'mkdir -p ${REPORT_DIR}'
+      options { timeout(time: 24, unit: 'HOURS') }
+      environment { ZAP_IMAGE = "ghcr.io/zaproxy/zaproxy:stable" }
+      steps {
+        script { if (env.DAST_MODE == 'abort') { milestone(40) } }
+        sh 'mkdir -p ${REPORT_DIR}'
 
-    sshagent(credentials: [env.DAST_SSH_CRED]) {
-      lock(resource: 'dast-scan', inversePrecedence: true) {
-        sh '''
+        sshagent(credentials: [env.DAST_SSH_CRED]) {
+          lock(resource: 'dast-scan', inversePrecedence: true) {
+            sh '''
 set -e
 SSH_OPTS='-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes'
 
@@ -421,48 +408,39 @@ BASH
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_JSON}"  "${REPORT_DIR}/${REPORT_JSON}"  || true
 '''
-
-
-      }
-    }
-  }
-}
-
-
+          } // end lock
+        }   // end sshagent
+      }     // end steps
+    }       // end stage Run DAST scan on DAST VM
 
     stage('Collect & Normalize findings') {
-      when {
-        expression { env.USE_AI == 'true' }
-      }
+      when { expression { env.USE_AI == 'true' } }
       steps {
-        sh '''set -eu
+        sh '''
+set -eu
 python3 collector_normalize.py
 '''
       }
     }
 
     stage('AI Triage & Recommend') {
-  when {
-    expression { env.USE_AI == 'true' && fileExists("${env.REPORT_DIR}/findings_raw.json") }
-  }
-  steps {
-    withCredentials([string(credentialsId: 'gemini_api_key', variable: 'GEMINI_API_KEY')]) {
-      sh '''set -eu
+      when { expression { env.USE_AI == 'true' && fileExists("${env.REPORT_DIR}/findings_raw.json") } }
+      steps {
+        withCredentials([string(credentialsId: 'gemini_api_key', variable: 'GEMINI_API_KEY')]) {
+          sh '''
+set -eu
 python3 ai_triage.py
 '''
+        }
+      }
     }
-  }
-}
-}
-
 
     stage('Publish grouped AI-refined issues') {
-      when {
-        expression { env.USE_AI == 'true' && fileExists("${env.REPORT_DIR}/ai_findings.json") }
-      }
+      when { expression { env.USE_AI == 'true' && fileExists("${env.REPORT_DIR}/ai_findings.json") } }
       steps {
         withCredentials([string(credentialsId: env.GITHUB_TOKEN_CRED, variable: 'GITHUB_TOKEN')]) {
-          sh '''set -eu
+          sh '''
+set -eu
 export GH_TOKEN="${GITHUB_TOKEN}"
 python3 create_issues_grouped.py
 '''
@@ -502,11 +480,18 @@ elif [ -f "k8s-deployment.yaml" ]; then
     kubectl apply -f k8s-deployment.yaml
   "
 else
-  # Simple docker run fallback
+  # Simple docker run fallback (port collision safe)
   ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "
+    set -eu
+    PORT=${APP_EXTERNAL_PORT}
+    if ss -ltn | awk '{print \$4}' | grep -q \":\${PORT}\$\"; then
+      echo \"Port \${PORT} dolu, 8081'e geçiliyor\"
+      PORT=8081
+    fi
     docker stop app-container 2>/dev/null || true
     docker rm app-container 2>/dev/null || true
-    docker run -d --name app-container -p 8080:80 ${IMAGE_NAME}:${IMAGE_TAG}
+    docker run -d --name app-container -p \${PORT}:${APP_INTERNAL_PORT} ${IMAGE_NAME}:${IMAGE_TAG}
+    echo \"DEPLOY_PORT=\${PORT}\" > ${DEPLOY_DIR}/.deploy_env
   "
 fi
 '''
@@ -521,16 +506,22 @@ fi
 set -eu
 SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
-# Health check via DAST VM → APP VM
+# Health check via DAST VM → APP VM (read port from .deploy_env if exists)
+PORT_FILE="${DEPLOY_DIR}/.deploy_env"
+HC_PORT=8080
+if ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "[ -f ${PORT_FILE} ]"; then
+  HC_PORT=$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "grep -oE 'DEPLOY_PORT=[0-9]+' ${PORT_FILE} | cut -d= -f2 || echo 8080")
+fi
+
 for i in $(seq 1 30); do
-  CODE="$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "curl -s -o /dev/null -w '%{http_code}' http://${APP_HOST}:8080${HEALTH_CHECK_PATH} || echo 'ERROR'")"
+  CODE="$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "curl -s -o /dev/null -w '%{http_code}' http://${APP_HOST}:${HC_PORT}${HEALTH_CHECK_PATH} || echo 'ERROR'")"
   echo "Health check attempt $i: HTTP $CODE"
-  
+
   if [ "$CODE" = "200" ]; then
     echo "✅ Health check passed"
     exit 0
   fi
-  
+
   sleep 10
 done
 
@@ -557,8 +548,8 @@ PY'''
 
       // Archive reports
       archiveArtifacts artifacts: "${REPORT_DIR}/*", allowEmptyArchive: true
-      
-      // Publish test results if available
+
+      // Publish report if available
       script {
         if (fileExists("${REPORT_DIR}/${REPORT_HTML}")) {
           publishHTML([
@@ -575,7 +566,6 @@ PY'''
 
     aborted {
       echo 'Build aborted → Cleaning resources on DAST VM'
-      // Optional: Add cleanup scripts here
     }
 
     success {
