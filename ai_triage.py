@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
-# ai_triage.py (OPTIMIZED VERSION)
-import os, sys, json, re, time, hashlib, urllib.request, urllib.error
-from collections import defaultdict, Counter
+# ai_triage.py (GEMINI-ONLY, cost-optimized)
+import os, sys, json, time, hashlib, urllib.request, urllib.error
+from collections import defaultdict
 
 REPORT_DIR = os.environ.get("REPORT_DIR","reports")
 IN_PATH    = os.path.join(REPORT_DIR, "findings_raw.json")
 OUT_PATH   = os.path.join(REPORT_DIR, "ai_findings.json")
 BODIES_OUT = os.path.join(REPORT_DIR, "ai_bodies.json")
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY","").strip()
-OPENAI_MODEL   = os.environ.get("OPENAI_MODEL","gpt-4o")
-OPENAI_BASE    = os.environ.get("OPENAI_BASE","https://api.openai.com/v1/chat/completions")
+# ------------ Gemini config ------------
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL","gemini-1.5-flash").strip()
+GEMINI_BASE    = os.environ.get("GEMINI_BASE","https://generativelanguage.googleapis.com/v1beta/models").strip()
 
-if not OPENAI_API_KEY:
-    for p in (OUT_PATH, BODIES_OUT):
-        try:
-            if os.path.exists(p): os.remove(p)
-        except Exception:
-            pass
-    print("[AI] skipped: OPENAI_API_KEY not set -> no triage, no outputs.")
-    sys.exit(0)
+# Cost/limit knobs
+AI_ONLY_SEVERITIES = set([s.strip().lower() for s in (os.environ.get("AI_ONLY_SEVERITIES","low,medium,high,critical,info").split(",")) if s.strip()])
+AI_MAX_FINDINGS    = int(os.environ.get("AI_MAX_FINDINGS","200"))
+AI_BATCH_SIZE      = int(os.environ.get("AI_BATCH_SIZE","25"))
+AI_SLEEP_BETWEEN   = float(os.environ.get("AI_SLEEP_BETWEEN","1.0"))
 
 # ---------- helpers ----------
 def _lower(s): return (s or "").lower()
 def digest(*parts):
     h = hashlib.sha1()
-    for p in parts:
-        h.update((_lower(str(p))).encode("utf-8","ignore"))
+    for p in parts: h.update((_lower(str(p))).encode("utf-8","ignore"))
     return h.hexdigest()[:12]
 
 PLUGIN_XSS  = {"40012","40014","40016","40017","40026"}
@@ -50,11 +47,17 @@ def norm_sev(s):
     if s in ("4","critical","very high","urgent"): return "critical"
     return "unknown"
 
-with open(IN_PATH,"r",encoding="utf-8") as fh:
-    raw = json.load(fh)
+# ---------- load raw ----------
+try:
+    with open(IN_PATH,"r",encoding="utf-8") as fh:
+        raw = json.load(fh)
+except FileNotFoundError:
+    print(f"[AI] skipped: {IN_PATH} not found.")
+    sys.exit(0)
 
 items = raw["findings"] if isinstance(raw, dict) and "findings" in raw else (raw if isinstance(raw, list) else [])
 
+# ---------- normalize ----------
 norm = []
 for it in items:
     f = dict(it or {})
@@ -83,123 +86,122 @@ for it in items:
         "class": klass
     })
 
+# dedup
 seen, dedup = set(), []
 for f in norm:
     if f["id"] in seen: continue
     seen.add(f["id"]); dedup.append(f)
 
-# ---------- AI enrichment ----------
-def call_openai(batch):
-    # Prepare simplified input for AI
+# ---------- throttle by severity / cap count ----------
+if AI_ONLY_SEVERITIES:
+    dedup = [x for x in dedup if (x["severity"] in AI_ONLY_SEVERITIES)]
+if AI_MAX_FINDINGS and len(dedup) > AI_MAX_FINDINGS:
+    buckets = defaultdict(list)
+    for x in dedup:
+        key = (x["severity"], x["class"])
+        if len(buckets[key]) < 50:
+            buckets[key].append(x)
+    pooled = []
+    for _, arr in buckets.items():
+        pooled.extend(arr)
+    dedup = pooled[:AI_MAX_FINDINGS]
+
+# ---------- Gemini call ----------
+def call_gemini(batch):
     payload_items = []
     for x in batch:
-        # Create a concise description for the AI
-        description = f"{x['title']}. Severity: {x['severity']}. Target: {x['url'] or 'N/A'}. Evidence: {x.get('evidence', '')[:200]}"
-        payload_items.append({
-            "id": x["id"],
-            "description": description
-        })
+        ev = (x.get("evidence","") or "")[:160].replace("\n"," ")
+        desc = f"{x['title']} | sev={x['severity']} | url={x['url'] or 'N/A'} | ev={ev}"
+        payload_items.append({"id": x["id"], "d": desc})
 
-    sys_prompt = """You are a security expert analyzing vulnerability findings. For each finding provided, return a JSON object with the following structure for each finding ID:
-
-{
-  "ai_priority": "P0/P1/P2/P3/P4",
-  "ai_suspected_fp": true/false,
-  "why_opened": "2-4 sentence explanation of impact and exploitability",
-  "remediation": "3-6 actionable remediation steps as a single string with numbered steps",
-  "references": ["URL1", "URL2", "URL3"] (2-5 reputable security references)
-}
-
-PRIORITY GUIDE:
-- P0: Critical severity, actively exploited, immediate action required
-- P1: High severity, easily exploitable, important to fix
-- P2: Medium severity, requires specific conditions to exploit
-- P3: Low severity, limited impact or difficult to exploit
-- P4: Informational findings with no direct security impact
-
-FALSE POSITIVE GUIDANCE: Only mark as true if you're highly confident it's a false positive.
-
-Return ONLY valid JSON with finding IDs as keys."""
-
-    user_payload = json.dumps({"findings": payload_items}, ensure_ascii=False, indent=2)
-    
-    req_body = json.dumps({
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_payload}
-        ],
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-        "max_tokens": 4000
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        OPENAI_BASE, data=req_body, method="POST",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
+    sys_prompt = (
+        "You are a security triage assistant. For each finding id, return a JSON object keyed by id "
+        "with fields: ai_priority (P0..P4), ai_suspected_fp (boolean), why_opened ('<=2 sentences'), "
+        "remediation ('<=4 numbered steps'), references (array with up to 2 reputable URLs). "
+        "Return ONLY a JSON object and nothing else."
     )
-    
+    user_payload = json.dumps({"findings": payload_items}, ensure_ascii=False)
+
+    url = f"{GEMINI_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    body = {
+        "contents": [
+            {"role":"user", "parts":[{"text": sys_prompt + "\n\n" + user_payload}]}
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 1200,
+            "responseMimeType": "application/json"
+        }
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type":"application/json"}
+    )
+
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             data = json.loads(r.read().decode("utf-8"))
-        content = data["choices"][0]["message"]["content"]
-        
-        # Parse AI response
-        ai_response = json.loads(content.strip())
-        return ai_response
-        
+        text = (
+            data.get("candidates",[{}])[0]
+                .get("content",{}).get("parts",[{}])[0]
+                .get("text","")
+        )
+        return json.loads(text.strip()) if text.strip() else {}
     except urllib.error.HTTPError as e:
-        print(f"HTTP Error: {e.code} - {e.reason}")
-        print(f"Response: {e.read().decode()}")
-        return {}
-    except json.JSONDecodeError as e:
-        print(f"JSON Parse Error: {e}")
-        print(f"Raw response: {content}")
+        body = e.read().decode()
+        print(f"HTTP Error (Gemini): {e.code} - {e.reason}\nResponse: {body}")
+        if e.code == 429 or "quota" in body.lower() or "insufficient" in body.lower():
+            return "__ABORT_ALL__"
         return {}
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"Unexpected error (Gemini): {e}")
         return {}
 
-# Process findings in smaller batches for better reliability
-ai_results = {}
-BATCH_SIZE = 10
+# ---------- short-circuit if no key ----------
+if not GEMINI_API_KEY:
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    with open(OUT_PATH,"w",encoding="utf-8") as fh: json.dump(dedup, fh, ensure_ascii=False, indent=2)
+    with open(BODIES_OUT,"w",encoding="utf-8") as fh: json.dump(
+        {k:{"body":f"**{k.upper()}**: No AI triage (no GEMINI_API_KEY)."} for k in ("xss","sqli","rce","other")},
+        fh, ensure_ascii=False, indent=2
+    )
+    print("[AI] skipped: GEMINI_API_KEY not set -> wrote pass-through outputs.")
+    sys.exit(0)
 
-for i in range(0, len(dedup), BATCH_SIZE):
-    batch = dedup[i:i+BATCH_SIZE]
-    print(f"Processing batch {i//BATCH_SIZE + 1}/{(len(dedup)-1)//BATCH_SIZE + 1}")
-    
-    batch_results = call_openai(batch)
-    ai_results.update(batch_results)
-    
-    # Be gentle with the API
-    time.sleep(1.5)
+# ---------- triage (batched) ----------
+ai_results = {}
+if dedup:
+    total_batches = (len(dedup)-1)//AI_BATCH_SIZE + 1
+    for i in range(0, len(dedup), AI_BATCH_SIZE):
+        batch = dedup[i:i+AI_BATCH_SIZE]
+        print(f"Processing batch {i//AI_BATCH_SIZE + 1}/{total_batches} via gemini")
+        res = call_gemini(batch)
+        if res == "__ABORT_ALL__":
+            print("[AI] No quota — skipping remaining batches, falling back to defaults.")
+            ai_results = {}
+            break
+        if isinstance(res, dict):
+            ai_results.update(res)
+        time.sleep(AI_SLEEP_BETWEEN)
+else:
+    print("[AI] nothing to triage after filtering/grouping.")
 
 # ---------- merge & write ----------
+def default_refs():
+    return [
+        "https://owasp.org/www-project-top-ten/",
+        "https://cwe.mitre.org/",
+        "https://cheatsheetseries.owasp.org/"
+    ]
+
 enriched = []
 for f in dedup:
     finding_id = f["id"]
-    ai_data = ai_results.get(finding_id, {})
-    
-    # Ensure we have proper fallback values for all required fields
-    remediation = ai_data.get("remediation", "Review the finding manually for appropriate remediation steps.")
-    references = ai_data.get("references", [])
-    
-    # If remediation is empty, provide a default
-    if not remediation.strip():
-        remediation = "1. Review the vulnerability\n2. Implement appropriate security controls\n3. Test the fix\n4. Deploy the solution"
-    
-    # Ensure we have at least some references
-    if not references:
-        references = [
-            "https://owasp.org/www-project-top-ten/",
-            "https://cwe.mitre.org/",
-            "https://cheatsheetseries.owasp.org/"
-        ]
-    
-    # Create provenance information from original finding
+    ai = ai_results.get(finding_id, {}) or {}
+    remediation = (ai.get("remediation") or "").strip() or "1) İnceleyin  2) Uygun düzeltmeleri yapın  3) Test edin  4) Yayına alın"
+    refs = ai.get("references") or default_refs()
     prov = {
         "source": f["source"],
         "scanner": f["scanner"],
@@ -208,21 +210,18 @@ for f in dedup:
         "params": [p for p in {f.get("param")} if p],
         "evidence": [e for e in {f.get("evidence")} if e]
     }
-    
     enriched.append({
         **f,
-        "ai_priority": ai_data.get("ai_priority", "P3"),
-        "ai_suspected_fp": bool(ai_data.get("ai_suspected_fp", False)),
-        "why_opened": ai_data.get("why_opened", "Needs manual review for accurate assessment."),
+        "ai_priority": ai.get("ai_priority","P3"),
+        "ai_suspected_fp": bool(ai.get("ai_suspected_fp", False)),
+        "why_opened": ai.get("why_opened","Manual review recommended."),
         "remediation": remediation,
-        "references": references,
+        "references": refs,
         "provenance": prov
     })
 
-# Create grouped bodies for issue creation
 groups = defaultdict(list)
-for f in enriched: 
-    groups[f["class"]].append(f)
+for f in enriched: groups[f["class"]].append(f)
 
 def table(rows, headers):
     out = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
@@ -237,8 +236,7 @@ for klass in ("xss","sqli","rce","other"):
     if not items:
         bodies[klass] = {"body": f"**{klass.upper()}**: No findings.\nGenerated: {now}"}
         continue
-        
-    # Create summary table
+
     uniq, rows = set(), []
     for x in items:
         key = (x.get("pluginId"), x.get("url"))
@@ -246,14 +244,12 @@ for klass in ("xss","sqli","rce","other"):
         uniq.add(key)
         rows.append((x["severity"], x["title"], x.get("url",""), x.get("ai_priority","P3")))
         if len(rows) >= 15: break
-            
-    # Create detailed findings section
+
     details = []
     for x in items[:80]:
         prov = x.get("provenance") or {}
         urls = ", ".join(prov.get("urls") or ([x.get("url")] if x.get("url") else []))
         refs = "".join(f"\n  - {r}" for r in (x.get("references") or [])[:6])
-        
         details.append(
 f"""- **{x.get('title','')}** (`{x.get('severity','')}`, {x.get('ai_priority','P3')})
   - **Why:** {x.get('why_opened','')}
@@ -261,19 +257,15 @@ f"""- **{x.get('title','')}** (`{x.get('severity','')}`, {x.get('ai_priority','P
   - **Rule/Plugin:** {prov.get('rule_or_plugin','')}
   - **Evidence:** {", ".join((prov.get("evidence") or [])[:2])}
   - **Remediation:** {x.get('remediation','')}
-  - **References:**{refs}
-""".rstrip()
+  - **References:**{refs}"""
         )
-    
+
     body = f"{table(rows, ['Severity','Title','URL','Priority'])}\n\n<details><summary>Details (first 80)</summary>\n\n" + "\n\n".join(details) + f"\n\n</details>\n\nGenerated: {now}"
     bodies[klass] = {"body": body}
 
-# Write outputs
 os.makedirs(REPORT_DIR, exist_ok=True)
-with open(OUT_PATH,"w",encoding="utf-8") as fh: 
-    json.dump(enriched, fh, ensure_ascii=False, indent=2)
-with open(BODIES_OUT,"w",encoding="utf-8") as fh: 
-    json.dump(bodies, fh, ensure_ascii=False, indent=2)
+with open(OUT_PATH,"w",encoding="utf-8") as fh: json.dump(enriched, fh, ensure_ascii=False, indent=2)
+with open(BODIES_OUT,"w",encoding="utf-8") as fh: json.dump(bodies, fh, ensure_ascii=False, indent=2)
 
 print(f"[AI] refined -> {OUT_PATH}; total={len(enriched)}")
 print(f"[AI] class bodies -> {BODIES_OUT}; keys={list(bodies.keys())}")

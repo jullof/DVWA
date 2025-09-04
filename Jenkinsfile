@@ -28,12 +28,19 @@ environment {
   GITHUB_TOKEN_CRED = 'github_token_cred_id' 
   GITHUB_REPO       = 'jullof/DVWA'         
 
-  // ------------ AI  ------------
-  USE_AI       = 'true'               
-  SHOW_RECOM   = 'true'              
-  AI_THRESHOLD = '0.6'             
-  OPENAI_MODEL = 'gpt-5'              
-  OPENAI_BASE  = 'https://api.openai.com/v1/chat/completions' // API base
+   // ------------ AI (Gemini) ------------
+  USE_AI            = 'true'                   
+  SHOW_RECOM        = 'true'
+  AI_THRESHOLD      = '0.6'                    
+
+  GEMINI_MODEL      = 'gemini-1.5-flash'
+  GEMINI_BASE       = 'https://generativelanguage.googleapis.com/v1beta/models'
+
+  AI_ONLY_SEVERITIES = 'medium,high,critical'  
+  AI_MAX_FINDINGS    = '150'                  
+  AI_BATCH_SIZE      = '25'
+  AI_SLEEP_BETWEEN   = '1.0'
+
 
   // ==========================================================================
   // ==========================================================================
@@ -435,17 +442,19 @@ python3 collector_normalize.py
     }
 
     stage('AI Triage & Recommend') {
-      when {
-        expression { env.USE_AI == 'true' && fileExists("${env.REPORT_DIR}/findings_raw.json") }
-      }
-      steps {
-        withCredentials([string(credentialsId: 'openai_api_key_cred_id', variable: 'OPENAI_API_KEY')]) {
-          sh '''set -eu
+  when {
+    expression { env.USE_AI == 'true' && fileExists("${env.REPORT_DIR}/findings_raw.json") }
+  }
+  steps {
+    withCredentials([string(credentialsId: 'gemini_api_key', variable: 'GEMINI_API_KEY')]) {
+      sh '''set -eu
 python3 ai_triage.py
 '''
-        }
-      }
     }
+  }
+}
+}
+
 
     stage('Publish grouped AI-refined issues') {
       when {
