@@ -449,55 +449,26 @@ python3 create_issues_grouped.py
     }
 
     stage('Deploy to App VM') {
-      steps {
-        script { if (env.DAST_MODE == 'abort') { milestone(50) } }
-        sshagent(credentials: [env.DAST_SSH_CRED, env.APP_SSH_CRED]) {
-          sh '''#!/usr/bin/env bash
-set -eu
-SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+  steps {
+    milestone 50
+    sshagent(credentials: ['dast','app']) {
+      sh '''
+        set -e
+        docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip | \
+          ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} gunzip | docker load
 
-# Stream image DAST → APP over SSH (compressed)
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip -c" \
-| ssh $SSH_OPTS ${APP_USER}@${APP_HOST} 'gunzip -c | docker load'
-
-# Deploy application
-ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "mkdir -p ${DEPLOY_DIR}"
-
-# Copy deployment files if they exist
-if [ -f "docker-compose.yml" ]; then
-  scp -o StrictHostKeyChecking=no docker-compose.yml ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/docker-compose.yml
-  ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "
-    set -eux
-    cd ${DEPLOY_DIR}
-    IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${IMAGE_TAG} docker compose up -d --remove-orphans
-  "
-elif [ -f "k8s-deployment.yaml" ]; then
-  # Kubernetes deployment example
-  scp -o StrictHostKeyChecking=no k8s-deployment.yaml ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/
-  ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "
-    cd ${DEPLOY_DIR}
-    sed -i 's|IMAGE_PLACEHOLDER|${IMAGE_NAME}:${IMAGE_TAG}|g' k8s-deployment.yaml
-    kubectl apply -f k8s-deployment.yaml
-  "
-else
-  # Simple docker run fallback (port collision safe)
-  ssh $SSH_OPTS ${APP_USER}@${APP_HOST} "
-    set -eu
-    PORT=${APP_EXTERNAL_PORT}
-    if ss -ltn | awk '{print \$4}' | grep -q \":\${PORT}\$\"; then
-      echo \"Port \${PORT} dolu, 8081'e geçiliyor\"
-      PORT=8081
-    fi
-    docker stop app-container 2>/dev/null || true
-    docker rm app-container 2>/dev/null || true
-    docker run -d --name app-container -p \${PORT}:${APP_INTERNAL_PORT} ${IMAGE_NAME}:${IMAGE_TAG}
-    echo \"DEPLOY_PORT=\${PORT}\" > ${DEPLOY_DIR}/.deploy_env
-  "
-fi
-'''
-        }
-      }
+        scp -o StrictHostKeyChecking=no scripts/deploy_app.sh ${APP_USER}@${APP_HOST}:/tmp/deploy_app.sh
+        ssh -o StrictHostKeyChecking=no ${APP_USER}@${APP_HOST} "\
+          chmod +x /tmp/deploy_app.sh && \
+          IMAGE_NAME='${IMAGE_NAME}' IMAGE_TAG='${IMAGE_TAG}' \
+          APP_EXTERNAL_PORT='8080' APP_INTERNAL_PORT='80' \
+          APP_HEALTH_PATH='/login.php' CONTAINER_NAME='dvwa_app' \
+          /tmp/deploy_app.sh"
+      '''
     }
+  }
+}
+
 
     stage('Health check') {
       steps {

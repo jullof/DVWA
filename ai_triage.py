@@ -20,6 +20,52 @@ AI_BATCH_SIZE      = int(os.environ.get("AI_BATCH_SIZE","25"))
 AI_SLEEP_BETWEEN   = float(os.environ.get("AI_SLEEP_BETWEEN","1.0"))
 
 # ---------- helpers ----------
+
+import re
+
+
+CTRL_CHARS_RGX = re.compile(r'[\x00-\x1f\x7f]')
+
+def clean_text(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s or "")
+    # kontrol karakterleri ve NULL'lar
+    s = CTRL_CHARS_RGX.sub(' ', s)
+    # kimi modeller ```json ... ``` ile çitliyor
+    s = s.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        # ilk satır "json" yazıyorsa at
+        if s.startswith("json"):
+            s = s[4:].lstrip()
+    return s.strip()
+
+def extract_json_block(s: str) -> str:
+    """Metin içinden en geniş { ... } bloğunu kaba kuvvetle çıkar."""
+    s = clean_text(s)
+    start = s.find('{')
+    end   = s.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        return s[start:end+1]
+    return s
+
+def safe_json_loads(s: str):
+    s = extract_json_block(s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        # Çok kaba kurtarma: sonuna } ekleme denemesi
+        s2 = s.rstrip()
+        if not s2.endswith('}'):
+            s2 += '}'
+            try:
+                return json.loads(s2)
+            except Exception:
+                pass
+        # tamamen başarısızsa boş obje dön
+        return {}
+
+
 def _lower(s): return (s or "").lower()
 def digest(*parts):
     h = hashlib.sha1()
@@ -63,12 +109,12 @@ for it in items:
     f = dict(it or {})
     src  = f.get("source") or f.get("scanner") or f.get("tool") or "unknown"
     sev  = norm_sev(f.get("severity") or f.get("risk") or f.get("level") or "")
-    url  = f.get("url") or f.get("target") or f.get("endpoint") or ""
-    name = f.get("name") or f.get("title") or f.get("rule") or "Finding"
+    url  = clean_text(f.get("url") or f.get("target") or f.get("endpoint") or "")
+    name = clean_text(f.get("name") or f.get("title") or f.get("rule") or "Finding")
     plug = f.get("pluginId") or f.get("pluginid") or f.get("rule_id") or f.get("id") or ""
-    param = f.get("param") or ""
+    param = clean_text(f.get("param") or "")
     cwe = f.get("cwe") or f.get("cweId") or ""
-    ev  = f.get("evidence") or f.get("evidenceSnippet") or ""
+    ev  = clean_text(f.get("evidence") or f.get("evidenceSnippet") or "")
     klass = classify(name, plug, cwe)
     fid = f.get("id") or f.get("fingerprint") or f"{src}-{plug}-{digest(url,name,param or ev)}"
     norm.append({
@@ -77,7 +123,7 @@ for it in items:
         "scanner": f.get("scanner") or src,
         "severity": sev,
         "name": name,
-        "title": f.get("title") or name,
+        "title": name,
         "url": url,
         "param": param,
         "pluginId": str(plug),
@@ -85,6 +131,7 @@ for it in items:
         "evidence": ev,
         "class": klass
     })
+
 
 # dedup
 seen, dedup = set(), []
@@ -94,7 +141,7 @@ for f in norm:
 
 # ---------- throttle by severity / cap count ----------
 if AI_ONLY_SEVERITIES:
-    dedup = [x for x in dedup if (x["severity"] in AI_ONLY_SEVERITIES)]
+    dedup = [x for x in dedup if (x.get("severity","").lower() in AI_ONLY_SEVERITIES)]
 if AI_MAX_FINDINGS and len(dedup) > AI_MAX_FINDINGS:
     buckets = defaultdict(list)
     for x in dedup:
@@ -110,8 +157,10 @@ if AI_MAX_FINDINGS and len(dedup) > AI_MAX_FINDINGS:
 def call_gemini(batch):
     payload_items = []
     for x in batch:
-        ev = (x.get("evidence","") or "")[:160].replace("\n"," ")
-        desc = f"{x['title']} | sev={x['severity']} | url={x['url'] or 'N/A'} | ev={ev}"
+        ev = clean_text((x.get("evidence","") or ""))[:160].replace("\n"," ")
+        title = clean_text(x.get("title",""))
+        url = (x.get("url") or "N/A")
+        desc = f"{title} | sev={x['severity']} | url={url} | ev={ev}"
         payload_items.append({"id": x["id"], "d": desc})
 
     sys_prompt = (
@@ -140,24 +189,35 @@ def call_gemini(batch):
         headers={"Content-Type":"application/json"}
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        text = (
-            data.get("candidates",[{}])[0]
-                .get("content",{}).get("parts",[{}])[0]
-                .get("text","")
-        )
-        return json.loads(text.strip()) if text.strip() else {}
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        print(f"HTTP Error (Gemini): {e.code} - {e.reason}\nResponse: {body}")
-        if e.code == 429 or "quota" in body.lower() or "insufficient" in body.lower():
-            return "__ABORT_ALL__"
-        return {}
-    except Exception as e:
-        print(f"Unexpected error (Gemini): {e}")
-        return {}
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            text = (
+                data.get("candidates",[{}])[0]
+                    .get("content",{}).get("parts",[{}])[0]
+                    .get("text","")
+            )
+            text = clean_text(text)
+            if not text:
+                return {}
+            return safe_json_loads(text)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="ignore")
+            print(f"HTTP Error (Gemini): {e.code} - {e.reason}\nResponse: {body}")
+            if e.code == 429 or "quota" in body.lower() or "insufficient" in body.lower():
+                return "__ABORT_ALL__"
+            if e.code >= 500:
+                time.sleep(1.5 + attempt)
+                continue
+            return {}
+
+        except Exception as e:
+            print(f"Unexpected error (Gemini): {e}")
+            time.sleep(1.0 + 0.5*attempt)
+            continue
+    return {}
+
 
 # ---------- short-circuit if no key ----------
 if not GEMINI_API_KEY:
@@ -201,7 +261,13 @@ for f in dedup:
     finding_id = f["id"]
     ai = ai_results.get(finding_id, {}) or {}
     remediation = (ai.get("remediation") or "").strip() or "1) İnceleyin  2) Uygun düzeltmeleri yapın  3) Test edin  4) Yayına alın"
-    refs = ai.get("references") or default_refs()
+    refs = ai.get("references")
+    if isinstance(refs, str):
+        refs = [refs]
+    if not refs:
+        refs = default_refs()
+
+
     prov = {
         "source": f["source"],
         "scanner": f["scanner"],
@@ -223,15 +289,22 @@ for f in dedup:
 groups = defaultdict(list)
 for f in enriched: groups[f["class"]].append(f)
 
+def _cell(x, limit=120):
+    s = clean_text(str(x if x is not None else ""))
+    s = s.replace("|", "\\|")
+    return s[:limit]
+
 def table(rows, headers):
-    out = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
+    out = ["| " + " | ".join(_cell(h) for h in headers) + " |",
+           "| " + " | ".join("---" for _ in headers) + " |"]
     for r in rows:
-        out.append("| " + " | ".join((str(x) if x is not None else "")[:180] for x in r) + " |")
+        out.append("| " + " | ".join(_cell(x) for x in r) + " |")
     return "\n".join(out)
+
 
 now = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.gmtime())
 bodies = {}
-for klass in ("xss","sqli","rce","other"):
+for klass in ("xss", "sqli", "rce", "other"):
     items = groups.get(klass, [])
     if not items:
         bodies[klass] = {"body": f"**{klass.upper()}**: No findings.\nGenerated: {now}"}
@@ -240,28 +313,47 @@ for klass in ("xss","sqli","rce","other"):
     uniq, rows = set(), []
     for x in items:
         key = (x.get("pluginId"), x.get("url"))
-        if key in uniq: continue
+        if key in uniq:
+            continue
         uniq.add(key)
-        rows.append((x["severity"], x["title"], x.get("url",""), x.get("ai_priority","P3")))
-        if len(rows) >= 15: break
+        rows.append((x["severity"], x["title"], x.get("url", ""), x.get("ai_priority", "P3")))
+        if len(rows) >= 15:
+            break
 
     details = []
     for x in items[:80]:
         prov = x.get("provenance") or {}
         urls = ", ".join(prov.get("urls") or ([x.get("url")] if x.get("url") else []))
-        refs = "".join(f"\n  - {r}" for r in (x.get("references") or [])[:6])
+
+        raw_refs = x.get("references") or []
+        if isinstance(raw_refs, str):
+            raw_refs = [raw_refs]
+        refs_list = [clean_text(r) for r in raw_refs[:6]]
+        refs_md = "".join(f"\n  - {r}" for r in refs_list)
+
+        title_safe = clean_text(x.get("title", ""))
+        why_safe   = clean_text(x.get("why_opened", ""))
+        rem_safe   = clean_text(x.get("remediation", ""))
+
         details.append(
-f"""- **{x.get('title','')}** (`{x.get('severity','')}`, {x.get('ai_priority','P3')})
-  - **Why:** {x.get('why_opened','')}
+f"""- **{title_safe}** (`{x.get('severity','')}`, {x.get('ai_priority','P3')})
+  - **Why:** {why_safe}
   - **Where:** {urls}
   - **Rule/Plugin:** {prov.get('rule_or_plugin','')}
   - **Evidence:** {", ".join((prov.get("evidence") or [])[:2])}
-  - **Remediation:** {x.get('remediation','')}
-  - **References:**{refs}"""
+  - **Remediation:** {rem_safe}
+  - **References:**{refs_md}"""
         )
 
-    body = f"{table(rows, ['Severity','Title','URL','Priority'])}\n\n<details><summary>Details (first 80)</summary>\n\n" + "\n\n".join(details) + f"\n\n</details>\n\nGenerated: {now}"
+    body = (
+        f"{table(rows, ['Severity','Title','URL','Priority'])}\n\n"
+        f"<details><summary>Details (first 80)</summary>\n\n"
+        + "\n\n".join(details)
+        + f"\n\n</details>\n\nGenerated: {now}"
+    )
     bodies[klass] = {"body": body}
+
+
 
 os.makedirs(REPORT_DIR, exist_ok=True)
 with open(OUT_PATH,"w",encoding="utf-8") as fh: json.dump(enriched, fh, ensure_ascii=False, indent=2)
