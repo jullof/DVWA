@@ -521,7 +521,12 @@ ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} bash -lc "
     BODY=\${BODY//\${PH}/\${TOK}}
   fi
 
-  curl -skL -c \"\$CJ\" -b \"\$CJ\" -X '${AUTH_FORM_METHOD:-POST}' --data \"\$BODY\" \"${AUTH_FORM_URL/http:\/\/127.0.0.1:8080/http://${APP_HOST}:${HC_PORT}}\" >/dev/null || true
+LOGIN_URL="http://${APP_HOST}:${HC_PORT}/login.php"
+
+  curl -skL -c "$CJ" -b "$CJ" \
+  -X '${AUTH_FORM_METHOD:-POST}' \
+  --data "$BODY" \
+  "$LOGIN_URL" >/dev/null || true
 
   PCODE=\$(curl -skL -c \"\$CJ\" -b \"\$CJ\" -o /dev/null -w '%{http_code}' \"\$PROTECTED_URL\" || echo 000)
   echo \"Protected check HTTP \$PCODE\"
