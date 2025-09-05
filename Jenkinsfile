@@ -404,13 +404,20 @@ ZAP_Z=""
 [ -n "$AUTH_ZAP_OPTS" ] && ZAP_Z="-z $AUTH_ZAP_OPTS"
 
 echo ">>> Run ZAP DAST scan"
+
+EXC="${ZAP_EXCLUDE_REGEX:-.*logout.*|.*setup.*}"
+ZAP_ARGS=""
+
+[ -n "$AUTH_ZAP_OPTS" ] && ZAP_ARGS="$ZAP_ARGS -z $AUTH_ZAP_OPTS"
+
+[ -n "$EXC" ] && ZAP_ARGS="$ZAP_ARGS -z -config spider.excludeRegex=\"$EXC\""
+
 docker run --rm --network host -v ~/dast_wrk:/zap/wrk:rw "${ZAP_IMAGE}" \
   zap-full-scan.py -j \
     -t "${TARGET_URL}${APP_CONTEXT:-}" \
-    -x "$EXC" \
     -r "/zap/wrk/${REPORT_HTML}" \
     -J "/zap/wrk/${REPORT_JSON}" \
-    ${ZAP_Z} ${ZAP_EXTRA:-} || true
+    $ZAP_ARGS ${ZAP_EXTRA:-} || true
 BASH
 
 scp $SSH_OPTS ${DAST_USER}@${DAST_HOST}:"~/dast_wrk/${REPORT_HTML}"  "${REPORT_DIR}/${REPORT_HTML}"  || true
@@ -484,20 +491,14 @@ python3 create_issues_grouped.py
 
 
     stage('Health check') {
-      steps {
-        sshagent(credentials: [env.DAST_SSH_CRED]) {
-          sh '''
+  steps {
+    sshagent(credentials: [env.DAST_SSH_CRED]) {
+      sh '''
 set -eu
 SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
-PORT_FILE="${DEPLOY_DIR}/.deploy_env"
-HC_PORT=8080
-if ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "[ -f ${PORT_FILE} ]"; then
-  HC_PORT=$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "grep -oE 'DEPLOY_PORT=[0-9]+' ${PORT_FILE} | cut -d= -f2 || echo 8080")
-fi
-
 for i in $(seq 1 10); do
-  CODE="$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "curl -s -o /dev/null -w '%{http_code}' http://${APP_HOST}:${HC_PORT}/ || echo 000")"
+  CODE="$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "curl -s -o /dev/null -w '%{http_code}' http://${APP_HOST}:${APP_EXTERNAL_PORT}/ || echo 000")"
   echo "Health check attempt $i: HTTP $CODE"
   case "$CODE" in
     2*|3*) echo "Basic health OK ($CODE)"; break ;;
@@ -505,42 +506,44 @@ for i in $(seq 1 10); do
   sleep 3
 done
 
-ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} bash -lc "
-  set -eu
-  CJ=~/dast_wrk/health_cookies.txt
-  : > \"\$CJ\"
-  LOGIN_URL='http://${APP_HOST}:${HC_PORT}/login.php'
-  PROTECTED_URL='http://${APP_HOST}:${HC_PORT}/vulnerabilities/brute/'  # İstediğin iç sayfayla değiştir
+TMP=/tmp/hc_auth.sh
+cat > "$TMP" <<'REMOTE'
+set -eu
+CJ=~/dast_wrk/health_cookies.txt
+mkdir -p ~/dast_wrk
+: > "$CJ"
 
-  PAGE=\$(curl -skL \"\$LOGIN_URL\" || true)
-  TOK=\$(printf '%s' \"\$PAGE\" | grep -oP \"${AUTH_CSRF_REGEX}\" | head -n1 || true)
-  BODY='${AUTH_FORM_BODY}'
-  if [ -n \"\$TOK\" ]; then
-    PH='${AUTH_CSRF_BODY_PLACEHOLDER}'
-    [ -z \"\$PH\" ] && PH='{{CSRF}}'
-    BODY=\${BODY//\${PH}/\${TOK}}
-  fi
+LOGIN_URL="http://__APP_HOST__:__HC_PORT__/login.php"
+PROTECTED_URL="http://__APP_HOST__:__HC_PORT__/index.php"
 
-LOGIN_URL="http://${APP_HOST}:${HC_PORT}/login.php"
+PAGE="$(curl -skL "$LOGIN_URL" || true)"
+TOK="$(printf '%s' "$PAGE" | grep -oP "name=['\"]user_token['\"]\\s+value=['\"]\\K[^'\"]+" | head -n1 || true)"
 
-  curl -skL -c "$CJ" -b "$CJ" \
-  -X '${AUTH_FORM_METHOD:-POST}' \
-  --data "$BODY" \
-  "$LOGIN_URL" >/dev/null || true
+BODY="username=admin&password=password&Login=Login&user_token={{CSRF}}"
+if [ -n "$TOK" ]; then
+  PH='{{CSRF}}'
+  BODY=${BODY//${PH}/${TOK}}
+fi
 
-  PCODE=\$(curl -skL -c \"\$CJ\" -b \"\$CJ\" -o /dev/null -w '%{http_code}' \"\$PROTECTED_URL\" || echo 000)
-  echo \"Protected check HTTP \$PCODE\"
-  [ \"\$PCODE\" = \"200\" ] || exit 1
-"
+curl -skL -c "$CJ" -b "$CJ" -X 'POST' --data "$BODY" "$LOGIN_URL" >/dev/null || true
+
+PCODE="$(curl -skL -c "$CJ" -b "$CJ" -o /dev/null -w '%{http_code}' "$PROTECTED_URL" || echo 000)"
+echo "Protected check HTTP $PCODE"
+[ "$PCODE" = "200" ] || exit 1
+REMOTE
+
+sed -i "s|__APP_HOST__|${APP_HOST}|g; s|__HC_PORT__|${APP_EXTERNAL_PORT}|g" "$TMP"
+
+scp -q -o StrictHostKeyChecking=no "$TMP" ${DAST_USER}@${DAST_HOST}:/tmp/hc_auth.sh
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} 'bash /tmp/hc_auth.sh'
+rm -f "$TMP"
 
 echo "✅ Health check (authenticated) passed"
 '''
-
-        }
-      }
     }
-
-  } // end stages
+  }
+}
+ // end stages
 
   post {
     always {
@@ -577,7 +580,7 @@ PY'''
     }
 
     success {
-      echo "✅ DevSecOps Pipeline completed successfully: ${IMAGE_NAME}:${IMAGE_TAG}"
+      echo "✅ Pipeline completed successfully: ${IMAGE_NAME}:${IMAGE_TAG}"
     }
 
     failure {
