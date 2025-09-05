@@ -127,7 +127,7 @@ def call_gemini(prompt, retries=3, backoff=2.0):
             "topK": 40,
             "topP": 0.95,
             "maxOutputTokens": 2048,
-            "response_mime_type": "application/json"  # JSON dön demek
+            "response_mime_type": "application/json"  
         },
         "safetySettings": [
             {"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_NONE"},
@@ -223,10 +223,9 @@ for batch in chunked(raw, BATCH_SIZE):
         text = call_gemini(prompt)
         data = extract_json(text)
         if data and isinstance(data.get("items"), list) and data["items"]:
-            # Şemaya zorla
             for src, out in zip(batch, data["items"]):
                 all_items.append(coerce_item_schema(out, fallback_seed=src))
-            continue  # bu batch tamam
+            continue  
 
     all_items.extend([ minimal_item(it) for it in batch ])
 

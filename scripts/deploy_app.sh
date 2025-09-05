@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -eu  
 
 IMAGE_NAME="${IMAGE_NAME:-app-local}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
@@ -20,18 +20,29 @@ docker run -d --name "${CONTAINER_NAME}" \
   --restart unless-stopped \
   "${IMAGE_NAME}:${IMAGE_TAG}"
 
-# Health check
-i=0
-while [ $i -lt 60 ]; do
-  code="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${APP_EXTERNAL_PORT}${APP_HEALTH_PATH}")"
-  if [ "$code" = "200" ]; then
-    echo "App is healthy"
+sleep 2
+
+TARGET_URL="http://127.0.0.1:${APP_EXTERNAL_PORT}${APP_HEALTH_PATH}"
+echo ">>> Health probe: ${TARGET_URL}"
+
+i=0; max=60
+while [ $i -lt $max ]; do
+  code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            --fail --retry 5 --retry-connrefused --retry-delay 1 \
+            --connect-timeout 5 --max-time 10 \
+            -H 'Connection: close' \
+            "${TARGET_URL}" || echo 000)"
+
+  if [ "$code" = "200" ] || [ "$code" = "302" ]; then 
+    echo "App is healthy (HTTP $code)"
     exit 0
   fi
+
   i=$((i+1))
-  echo "Waiting ($i/60) code=$code"
+  echo "Waiting (${i}/${max}) code=${code}"
   sleep 2
 done
 
-echo "Health check failed"
+echo "Health check failed after ${max} attempts"
+docker logs --tail 80 "${CONTAINER_NAME}" || true
 exit 1
