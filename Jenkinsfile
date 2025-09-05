@@ -382,6 +382,14 @@ case "${AUTH_TYPE:-none}" in
                      -config replacer.full_list(0).regex=false \
                      -config replacer.full_list(0).replacement=${COOKIES}"
     fi
+    PROTECTED_URL="${TARGET_URL}/index.php"
+    P_CODE="$(curl -skL -b "$CJ" -c "$CJ" -o /dev/null -w '%{http_code}' "$PROTECTED_URL" || echo 000)"
+    if [ "$P_CODE" = "200" ]; then
+      echo "Auth OK on $PROTECTED_URL (HTTP 200)"
+    else
+      echo "WARN: Auth verification failed on $PROTECTED_URL (HTTP $P_CODE) — scan may be unauthenticated."
+    fi
+
     ;;
   none|*)
     :
@@ -482,28 +490,47 @@ python3 create_issues_grouped.py
 set -eu
 SSH_OPTS="-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
 
-# Health check via DAST VM → APP VM (read port from .deploy_env if exists)
 PORT_FILE="${DEPLOY_DIR}/.deploy_env"
 HC_PORT=8080
 if ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "[ -f ${PORT_FILE} ]"; then
   HC_PORT=$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "grep -oE 'DEPLOY_PORT=[0-9]+' ${PORT_FILE} | cut -d= -f2 || echo 8080")
 fi
 
-for i in $(seq 1 30); do
-  CODE="$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "curl -s -o /dev/null -w '%{http_code}' http://${APP_HOST}:${HC_PORT}${HEALTH_CHECK_PATH} || echo 'ERROR'")"
+for i in $(seq 1 10); do
+  CODE="$(ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} "curl -s -o /dev/null -w '%{http_code}' http://${APP_HOST}:${HC_PORT}/ || echo 000")"
   echo "Health check attempt $i: HTTP $CODE"
-
-  if [ "$CODE" = "200" ]; then
-    echo "✅ Health check passed"
-    exit 0
-  fi
-
-  sleep 10
+  case "$CODE" in
+    2*|3*) echo "Basic health OK ($CODE)"; break ;;
+  esac
+  sleep 3
 done
 
-echo "❌ Health check failed after 30 attempts"
-exit 1
+ssh $SSH_OPTS ${DAST_USER}@${DAST_HOST} bash -lc "
+  set -eu
+  CJ=~/dast_wrk/health_cookies.txt
+  : > \"\$CJ\"
+  LOGIN_URL='http://${APP_HOST}:${HC_PORT}/login.php'
+  PROTECTED_URL='http://${APP_HOST}:${HC_PORT}/vulnerabilities/brute/'  # İstediğin iç sayfayla değiştir
+
+  PAGE=\$(curl -skL \"\$LOGIN_URL\" || true)
+  TOK=\$(printf '%s' \"\$PAGE\" | grep -oP \"${AUTH_CSRF_REGEX}\" | head -n1 || true)
+  BODY='${AUTH_FORM_BODY}'
+  if [ -n \"\$TOK\" ]; then
+    PH='${AUTH_CSRF_BODY_PLACEHOLDER}'
+    [ -z \"\$PH\" ] && PH='{{CSRF}}'
+    BODY=\${BODY//\${PH}/\${TOK}}
+  fi
+
+  curl -skL -c \"\$CJ\" -b \"\$CJ\" -X '${AUTH_FORM_METHOD:-POST}' --data \"\$BODY\" \"${AUTH_FORM_URL/http:\/\/127.0.0.1:8080/http://${APP_HOST}:${HC_PORT}}\" >/dev/null || true
+
+  PCODE=\$(curl -skL -c \"\$CJ\" -b \"\$CJ\" -o /dev/null -w '%{http_code}' \"\$PROTECTED_URL\" || echo 000)
+  echo \"Protected check HTTP \$PCODE\"
+  [ \"\$PCODE\" = \"200\" ] || exit 1
+"
+
+echo "✅ Health check (authenticated) passed"
 '''
+
         }
       }
     }
